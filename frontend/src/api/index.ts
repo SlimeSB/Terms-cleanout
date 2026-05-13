@@ -71,7 +71,7 @@ export interface TermsResponse {
   page_size: number
 }
 
-export const getTerms = (params?: { search?: string; label?: string; page?: number; page_size?: number }) =>
+export const getTerms = (params?: { search?: string; label?: string; page?: number; page_size?: number; sort?: string }) =>
   api.get<TermsResponse>('/terms', { params })
 
 export const addTerm = (term: Term) =>
@@ -110,11 +110,11 @@ export const scanAll = () =>
 export const getBlacklist = () =>
   api.get<{ blacklist: string[] }>('/blacklist')
 
-export const addToBlacklist = (en: string) =>
-  api.post<{ blacklist: string[] }>('/blacklist', { en })
+export const addToBlacklist = (pattern: string) =>
+  api.post<{ blacklist: string[] }>('/blacklist', { pattern })
 
-export const removeFromBlacklist = (en: string) =>
-  api.delete<{ blacklist: string[] }>(`/blacklist/${encodeURIComponent(en)}`)
+export const removeFromBlacklist = (pattern: string) =>
+  api.delete<{ blacklist: string[] }>(`/blacklist/${encodeURIComponent(pattern)}`)
 
 export const addLabel = (en: string, label: string) =>
   api.post<{ labels: string[] }>(`/terms/${encodeURIComponent(en)}/label`, { label })
@@ -124,3 +124,15 @@ export const removeLabel = (en: string, label: string) =>
 
 export const getLabels = () =>
   api.get<{ labels: string[] }>('/terms/labels')
+
+export const getGhostTerms = () =>
+  api.get<{ ghost_terms: Term[]; total_terms: number; ghost_count: number }>('/terms/ghost')
+
+export const getNonTerms = () =>
+  api.get<{ non_terms: string[] }>('/non-terms')
+
+export const addNonTerm = (pattern: string) =>
+  api.post<{ non_terms: string[] }>('/non-terms', { pattern })
+
+export const removeNonTerm = (pattern: string) =>
+  api.delete<{ non_terms: string[] }>(`/non-terms/${encodeURIComponent(pattern)}`)

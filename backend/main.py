@@ -1,7 +1,10 @@
 import json
 import os
 import re
+from itertools import product
 from typing import Optional
+
+import functools
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,8 +39,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TERMS_FILE = os.path.join(os.path.dirname(__file__), "terms.json")
 BLACKLIST_FILE = os.path.join(os.path.dirname(__file__), "blacklist.json")
+NON_TERMS_FILE = os.path.join(os.path.dirname(__file__), "non_terms.json")
 
 
 def _rows_to_terms(rows: list[dict]) -> list[Term]:
@@ -83,24 +86,67 @@ def save_terms(terms: list[Term]):
     replace_all_terms([_term_to_row(t) for t in terms])
 
 
+_blacklist_cache: list[str] | None = None
+_blacklist_re_cache: list[re.Pattern] | None = None
+
+# Characters that unambiguously indicate a regex pattern (not just a literal key name)
+_RE_META = re.compile(r'[\\()[\]{}^*+?$|]')
+
+
+def _has_regex_meta(pattern: str) -> bool:
+    """True if pattern contains regex metacharacters beyond plain dots/letters."""
+    return bool(_RE_META.search(pattern))
+
+
 def load_blacklist() -> list[str]:
+    global _blacklist_cache, _blacklist_re_cache
+    if _blacklist_cache is not None:
+        return _blacklist_cache
     if not os.path.exists(BLACKLIST_FILE):
-        return []
+        _blacklist_cache = []
+        _blacklist_re_cache = []
+        return _blacklist_cache
     with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data if isinstance(data, list) else []
+    if isinstance(data, dict):
+        items = list(data.keys())
+        save_blacklist(items)
+        _blacklist_cache = items
+        _blacklist_re_cache = [re.compile(p) for p in items]
+        return _blacklist_cache
+    items = data if isinstance(data, list) else []
+    _blacklist_cache = items
+    _blacklist_re_cache = [re.compile(p) for p in items]
+    return _blacklist_cache
 
 
-def save_blacklist(bl: list[str]):
+def save_blacklist(items: list[str]):
+    global _blacklist_cache, _blacklist_re_cache
     with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(bl, f, ensure_ascii=False, indent=2)
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    _blacklist_cache = None
+    _blacklist_re_cache = None
 
 
-def build_term_map(terms: list[Term], blacklist: set[str] | None = None) -> dict[str, list[Term]]:
+def _get_blacklist_exclude_keys() -> list[str]:
+    """Return blacklist patterns that are literal keys (safe for SQL NOT IN)."""
+    return [p for p in load_blacklist() if not _has_regex_meta(p)]
+
+
+def is_blacklisted_key(entry_key: str) -> bool:
+    """True if key matches a regex-type blacklist pattern (non-literal patterns only)."""
+    load_blacklist()
+    for pattern in _blacklist_re_cache or []:
+        if _has_regex_meta(pattern.pattern) and pattern.search(entry_key):
+            return True
+    return False
+
+
+def build_term_map(terms: list[Term], bl_for_key: set[str] | None = None) -> dict[str, list[Term]]:
     """Build a map from lowercase en word to all matching terms, excluding blacklisted."""
     m = {}
     for t in terms:
-        if blacklist and t.en.lower() in blacklist:
+        if bl_for_key and t.en.lower() in bl_for_key:
             continue
         key = t.en.lower()
         m.setdefault(key, []).append(t)
@@ -126,7 +172,7 @@ def build_structured_patterns(terms: list[Term]) -> list[tuple]:
             regex_parts = []
             for part in parts:
                 if re.fullmatch(r"\{\d+\}", part):
-                    regex_parts.append(r"(\S+)")
+                    regex_parts.append(r"(\S+(?:\s+\S+)*)")
                 else:
                     regex_parts.append(re.escape(part))
             regex_str = "".join(regex_parts)
@@ -198,7 +244,7 @@ def join_zh(parts: list[str]) -> str:
     return " ".join(parts)
 
 
-def generate_zh(en_text: str, phrase_map: dict[str, list[Term]], blacklist: set[str],
+def generate_zh(en_text: str, phrase_map: dict[str, list[Term]],
                phrase_prefix: dict[str, list[tuple[int, str, list[Term]]]] | None = None,
                zh_actual: str | None = None,
                structured_patterns: list[tuple] | None = None,
@@ -265,20 +311,20 @@ def generate_zh(en_text: str, phrase_map: dict[str, list[Term]], blacklist: set[
                     # Skip if an exact phrase match already covers this position (same or more words)
                     if any(c is not None and c >= n_words for c, _, _, _ in opts):
                         continue
-                    # Resolve each captured group's translation recursively (no scope check for fragments)
-                    resolved: list[str] = []
+                    # Generate ALL possible zh options for each captured group,
+                    # so DFS can pick the combination that matches zh_actual.
+                    group_options: list[list[str]] = []
                     for g in groups:
-                        g_zh, _, _, found = generate_zh(
-                            g, phrase_map, blacklist, phrase_prefix,
-                            structured_patterns=structured_patterns,
-                            resolve_pattern=False,
-                        )
-                        resolved.append(g_zh if g_zh else g)
-                    for zh_text in sorted(t.zh, key=lambda x: -len(x)):
-                        result_zh = zh_text
-                        for idx, r in enumerate(resolved):
-                            result_zh = result_zh.replace(f"{{{idx}}}", r)
-                        opts.append((n_words, result_zh, t.variable_pos, "|".join(t.en)))
+                        c = strip_word(g)
+                        opts_for_group = [z for t2 in phrase_map.get(c, [])
+                                          for z in sorted(t2.zh, key=lambda x: -len(x))]
+                        group_options.append(opts_for_group if opts_for_group else [g])
+                    for zht in sorted(t.zh, key=lambda x: -len(x)):
+                        for combo in product(*group_options):
+                            result_zh = zht
+                            for idx, r in enumerate(combo):
+                                result_zh = result_zh.replace(f"{{{idx}}}", r)
+                            opts.append((n_words, result_zh, t.variable_pos, "|".join(t.en)))
 
         if opts:
             # Sort: longer zh first (None values at end)
@@ -288,16 +334,23 @@ def generate_zh(en_text: str, phrase_map: dict[str, list[Term]], blacklist: set[
             for j in range(n):
                 word_covered[i + j] = True
         else:
-            c = strip_word(words[i])
-            if c in blacklist or words[i].lower() in blacklist:
-                opts.append((1, None, False, None))
-                word_covered[i] = True
-            else:
-                opts.append((1, None, False, None))
+            opts.append((1, None, False, None))
 
         segments.append(opts)
         i += 1
     all_ok = all(word_covered)
+
+    # 收集所有参与匹配的术语名称（包括结构化模式内部解析出的子术语）
+    all_term_names: list[str] = []
+    seen_terms: set[str] = set()
+    for seg in segments:
+        for _, _, _, en_str in seg:
+            if en_str:
+                for name in en_str.split('|'):
+                    key = name.strip().lower()
+                    if key and key not in seen_terms:
+                        seen_terms.add(key)
+                        all_term_names.append(name.strip())
 
     # ── DFS to find best matching combination ──
     from collections import Counter
@@ -367,7 +420,12 @@ def generate_zh(en_text: str, phrase_map: dict[str, list[Term]], blacklist: set[
             pos += n
         match_found = False
 
-    return join_zh(res_parts), res_matched, all_ok, match_found
+    # 合并最终路径的术语 + 所有段中出现的术语（供前端切换选择）
+    combined = res_matched.copy()
+    for name in all_term_names:
+        if name not in combined:
+            combined.append(name)
+    return join_zh(res_parts), combined, all_ok, match_found
 
 
 def scope_equal(s1: dict | None, s2: dict | None) -> bool:
@@ -379,39 +437,56 @@ def scope_equal(s1: dict | None, s2: dict | None) -> bool:
     return s1 == s2
 
 
+def merge_term_into_library(term: Term, existing: list[Term] | None = None) -> tuple[list[Term], bool, bool, bool]:
+    """Merge a single Term into the term library.
+    Returns (updated_library, is_new, is_merged, is_split).
+    - is_new: term was appended fresh (no overlap with any existing)
+    - is_merged: term's values were merged into an existing entry
+    - is_split: term was added as separate entry due to scope/var mismatch
+    - all False: term already exists (skipped)
+    """
+    init_terms_table()
+    if existing is None:
+        existing = load_terms()
+
+    in_en_set = set(e.lower() for e in term.en)
+    in_zh_set = set(term.zh)
+
+    for t in existing:
+        if (set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set
+                and t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope)):
+            return existing, False, False, False
+
+    for t in existing:
+        existing_en_set = set(e.lower() for e in t.en)
+        existing_zh_set = set(t.zh)
+        if not (existing_en_set & in_en_set or existing_zh_set & in_zh_set):
+            continue
+        new_ens = [e for e in term.en if e.lower() not in existing_en_set]
+        new_zhs = [z for z in term.zh if z not in existing_zh_set]
+        if not new_ens and not new_zhs:
+            return existing, False, False, False
+        if t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope):
+            if new_ens:
+                t.en.extend(new_ens)
+            if new_zhs:
+                t.zh.extend(new_zhs)
+            return existing, False, True, False
+        else:
+            existing.append(term)
+            return existing, True, False, True
+
+    existing.append(term)
+    return existing, True, False, False
+
+
 def do_import(import_terms: list[ImportTerm]) -> list[Term]:
     init_terms_table()
     existing = load_terms()
     for it in import_terms:
-        in_en_set = set(e.lower() for e in it.en)
-        in_zh_set = set(it.zh)
-        found = False
-        for t in existing:
-            if set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set:
-                found = True
-                break
-        if found:
-            continue
-        for t in existing:
-            existing_en_set = set(e.lower() for e in t.en)
-            existing_zh_set = set(t.zh)
-            if not (existing_en_set & in_en_set or existing_zh_set & in_zh_set):
-                continue
-            new_ens = [e for e in it.en if e.lower() not in existing_en_set]
-            new_zhs = [z for z in it.zh if z not in existing_zh_set]
-            if t.variable_pos == it.variable_pos and scope_equal(t.scope, it.scope):
-                if new_ens:
-                    t.en.extend(new_ens)
-                if new_zhs:
-                    t.zh.extend(new_zhs)
-            else:
-                existing.append(Term(en=it.en, zh=it.zh, scope=it.scope,
-                                    variable_pos=it.variable_pos, labels=it.labels))
-            found = True
-            break
-        if not found:
-            existing.append(Term(en=it.en, zh=it.zh, scope=it.scope,
-                                variable_pos=it.variable_pos, labels=it.labels))
+        term = Term(en=it.en, zh=it.zh, scope=it.scope,
+                    variable_pos=it.variable_pos, labels=it.labels)
+        existing, _, _ = merge_term_into_library(term, existing)
     save_terms(existing)
     return existing
 
@@ -428,30 +503,52 @@ def api_entries(
     sort: str = "",
     hide_matched: str = "false",
 ):
-    if hide_matched == "true":
+    exclude_keys = _get_blacklist_exclude_keys() + _get_non_term_exclude_keys()
+
+    # freq sort or hide_matched both need full list for processing
+    if hide_matched == "true" or sort == "freq":
         terms = load_terms()
-        blacklist = set(e.lower() for e in load_blacklist())
         phrase_map = build_phrase_map(terms)
         phrase_prefix = build_phrase_prefix(phrase_map)
         structured_patterns = build_structured_patterns(terms)
-        all_raw = fetch_entries(page=1, page_size=99999, search=search, version=version, sort="")["entries"]
-        filtered = []
-        for e in all_raw:
-            en_text = e["en_us"] or ""
-            if not en_text.split():
-                filtered.append(e)
-                continue
-            _, _, all_ok, _ = generate_zh(
-                en_text, phrase_map, blacklist, phrase_prefix,
-                structured_patterns=structured_patterns,
-                entry_key=e.get("key", ""), entry_en=en_text,
-                entry_zh=e.get("zh_cn", ""),
-                entry_ver_start=e.get("version_start", ""),
-                entry_ver_end=e.get("version_end", ""),
-            )
-            if not all_ok:
-                filtered.append(e)
-        if sort == "en":
+        all_raw = fetch_entries(page=1, page_size=99999, search=search, version=version, sort="", exclude_keys=exclude_keys)["entries"]
+
+        if hide_matched == "true":
+            filtered = []
+            for e in all_raw:
+                if is_blacklisted_key(e.get("key", "")) or is_non_term_key(e.get("key", "")):
+                    continue
+                en_text = e["en_us"] or ""
+                if not en_text.split():
+                    filtered.append(e)
+                    continue
+                _, _, all_ok, _ = generate_zh(
+                    en_text, phrase_map, phrase_prefix,
+                    structured_patterns=structured_patterns,
+                    entry_key=e.get("key", ""), entry_en=en_text,
+                    entry_zh=e.get("zh_cn", ""),
+                    entry_ver_start=e.get("version_start", ""),
+                    entry_ver_end=e.get("version_end", ""),
+                )
+                if not all_ok:
+                    filtered.append(e)
+        else:
+            filtered = all_raw[:]
+
+        if sort == "freq":
+            freq: dict[str, int] = {}
+            for e in all_raw:
+                for w in (e["en_us"] or "").lower().split():
+                    wc = w.strip(",.!?;:\"'()[]{}")
+                    if wc:
+                        freq[wc] = freq.get(wc, 0) + 1
+            filtered.sort(key=lambda e: (
+                -max(freq.get(w.strip(",.!?;:\"'()[]{}"), 0) for w in (e["en_us"] or "").lower().split() or ["_"]),
+                (len((e["en_us"] or "").split())),
+                len(e["en_us"] or ""),
+                (e["en_us"] or ""),
+            ))
+        elif sort == "en":
             filtered.sort(key=lambda e: (
                 (len((e["en_us"] or "").split())),
                 len(e["en_us"] or ""),
@@ -461,7 +558,49 @@ def api_entries(
         offset = (page - 1) * page_size
         page_entries = filtered[offset:offset + page_size]
         return {"entries": page_entries, "total": total, "page": page, "page_size": page_size}
-    return fetch_entries(page=page, page_size=page_size, search=search, version=version, sort=sort)
+    return fetch_entries(page=page, page_size=page_size, search=search, version=version, sort=sort, exclude_keys=exclude_keys)
+
+
+_non_terms_cache: list[str] | None = None
+_non_terms_re_cache: list[re.Pattern] | None = None
+
+
+def load_non_terms() -> list[str]:
+    global _non_terms_cache, _non_terms_re_cache
+    if _non_terms_cache is not None:
+        return _non_terms_cache
+    if not os.path.exists(NON_TERMS_FILE):
+        _non_terms_cache = []
+        _non_terms_re_cache = []
+        return _non_terms_cache
+    with open(NON_TERMS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    items = data if isinstance(data, list) else []
+    _non_terms_cache = items
+    _non_terms_re_cache = [re.compile(p) for p in items]
+    return _non_terms_cache
+
+
+def save_non_terms(items: list[str]):
+    global _non_terms_cache, _non_terms_re_cache
+    with open(NON_TERMS_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    _non_terms_cache = None
+    _non_terms_re_cache = None
+
+
+def _get_non_term_exclude_keys() -> list[str]:
+    """Return non-term patterns that are literal keys (safe for SQL NOT IN)."""
+    return [p for p in load_non_terms() if not _has_regex_meta(p)]
+
+
+def is_non_term_key(entry_key: str) -> bool:
+    """True if key matches a regex-type non-term pattern (non-literal patterns only)."""
+    load_non_terms()
+    for pattern in _non_terms_re_cache or []:
+        if _has_regex_meta(pattern.pattern) and pattern.search(entry_key):
+            return True
+    return False
 
 
 @app.get("/api/entries/{key:path}")
@@ -478,9 +617,10 @@ def api_list_terms(
     label: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(9999, ge=1, le=99999),
+    sort: str = "",
 ):
     init_terms_table()
-    result = fetch_terms(search=search, label=label, page=page, page_size=page_size)
+    result = fetch_terms(search=search, label=label, page=page, page_size=page_size, sort=sort)
     return {
         "terms": _rows_to_terms(result["terms"]),
         "total": result["total"],
@@ -491,22 +631,25 @@ def api_list_terms(
 
 def extend_term_version_from_db(term: Term):
     """Scan DB for exact en_us+zh_cn matches and extend term's scope.version."""
-    from database import get_connection
+    from database import get_connection, _schema
     conn = get_connection()
+    s = _schema()
+    tbl = s['table']
+    ver_col = s['ver_col']
     try:
         scope = term.scope or {}
         for en_v in term.en:
             for zh_v in term.zh:
-                rows = conn.execute(
-                    "SELECT version_start, version_end FROM vanilla_keys WHERE en_us = ? AND zh_cn = ?",
-                    (en_v, zh_v),
-                ).fetchall()
+                if s['type'] == 'translations':
+                    sql = f"SELECT {ver_col} AS version_start FROM {tbl} WHERE en_us = ? AND zh_cn = ?"
+                else:
+                    sql = f"SELECT version_start FROM {tbl} WHERE en_us = ? AND zh_cn = ?"
+                rows = conn.execute(sql, (en_v, zh_v)).fetchall()
                 for r in rows:
                     vs = r["version_start"]
                     if vs and "version" not in scope:
                         scope["version"] = vs
                     elif vs and scope.get("version"):
-                        # Use the earlier version start as min
                         pass
         if scope:
             term.scope = scope
@@ -516,46 +659,10 @@ def extend_term_version_from_db(term: Term):
 
 @app.post("/api/terms")
 def api_add_term(term: Term):
-    init_terms_table()
     extend_term_version_from_db(term)
-    existing = load_terms()
-
-    in_en_set = set(e.lower() for e in term.en)
-    in_zh_set = set(term.zh)
-
-    for t in existing:
-        if (set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set
-                and t.variable_pos == term.variable_pos):
-            save_terms(existing)
-            return {"term": t, "new": False}
-
-    for t in existing:
-        existing_en_set = set(e.lower() for e in t.en)
-        existing_zh_set = set(t.zh)
-        en_overlap = existing_en_set & in_en_set
-        zh_overlap = existing_zh_set & in_zh_set
-        if not en_overlap and not zh_overlap:
-            continue
-        new_ens = [e for e in term.en if e.lower() not in existing_en_set]
-        new_zhs = [z for z in term.zh if z not in existing_zh_set]
-        if not new_ens and not new_zhs:
-            save_terms(existing)
-            return {"term": t, "new": False}
-        if t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope):
-            if new_ens:
-                t.en.extend(new_ens)
-            if new_zhs:
-                t.zh.extend(new_zhs)
-            save_terms(existing)
-            return {"term": t, "new": False, "merged": True}
-        else:
-            existing.append(term)
-            save_terms(existing)
-            return {"term": term, "new": True, "split": True}
-
-    existing.append(term)
+    existing, is_new, is_merged, is_split = merge_term_into_library(term)
     save_terms(existing)
-    return {"term": term, "new": True}
+    return {"term": term, "new": is_new or is_split, "merged": is_merged, "split": is_split}
 
 
 @app.post("/api/terms/{en:path}/label")
@@ -597,6 +704,18 @@ def api_list_labels():
 @app.get("/api/terms/export")
 def api_export_terms():
     return {"terms": load_terms()}
+
+
+@app.get("/api/terms/ghost")
+def api_ghost_terms():
+    """Find ghost terms: terms in library that never appear in any entry's en_us."""
+    terms = load_terms()
+    if not terms:
+        return {"ghost_terms": [], "total_terms": 0, "ghost_count": 0}
+    all_entries = fetch_all_entries()
+    all_text = " ".join(e["en_us"] or "" for e in all_entries).lower()
+    ghost_terms = [t for t in terms if not is_structured_term(t) and not any(v.lower() in all_text for v in t.en)]
+    return {"ghost_terms": ghost_terms, "total_terms": len(terms), "ghost_count": len(ghost_terms)}
 
 
 @app.post("/api/terms/import")
@@ -643,47 +762,74 @@ def api_get_blacklist():
 
 @app.post("/api/blacklist")
 def api_add_to_blacklist(data: dict):
-    en = data.get("en", "").strip().lower()
-    if not en:
-        raise HTTPException(400, "en is required")
-    bl = load_blacklist()
-    if en not in bl:
-        bl.append(en)
-        save_blacklist(bl)
-    return {"blacklist": bl}
+    pattern = data.get("pattern", "").strip()
+    if not pattern:
+        raise HTTPException(400, "pattern is required")
+    items = load_blacklist()
+    if pattern not in items:
+        items.append(pattern)
+        save_blacklist(items)
+    return {"blacklist": items}
 
 
-@app.delete("/api/blacklist/{en:path}")
-def api_remove_from_blacklist(en: str):
-    bl = load_blacklist()
-    key = en.strip().lower()
-    new_bl = [e for e in bl if e != key]
-    if len(new_bl) == len(bl):
-        raise HTTPException(404, "Not found")
-    save_blacklist(new_bl)
-    return {"blacklist": new_bl}
+@app.delete("/api/blacklist/{pattern:path}")
+def api_remove_from_blacklist(pattern: str):
+    items = load_blacklist()
+    items = [p for p in items if p != pattern]
+    save_blacklist(items)
+    return {"blacklist": items}
+
+
+# ─── Non-terms ───────────────────────────────────────────────────────────
+
+
+@app.get("/api/non-terms")
+def api_get_non_terms():
+    return {"non_terms": load_non_terms()}
+
+
+@app.post("/api/non-terms")
+def api_add_non_term(data: dict):
+    pattern = data.get("pattern", "").strip()
+    if not pattern:
+        raise HTTPException(400, "pattern is required")
+    items = load_non_terms()
+    if pattern not in items:
+        items.append(pattern)
+        save_non_terms(items)
+    return {"non_terms": items}
+
+
+@app.delete("/api/non-terms/{pattern:path}")
+def api_remove_non_term(pattern: str):
+    items = load_non_terms()
+    items = [p for p in items if p != pattern]
+    save_non_terms(items)
+    return {"non_terms": items}
 
 
 @app.get("/api/scan-all")
 def api_scan_all():
-    """Scan all entries against full term library (excluding blacklist). Return only mismatches."""
+    """Scan all entries against full term library. Return only mismatches."""
     terms = load_terms()
-    blacklist = set(e.lower() for e in load_blacklist())
     phrase_map = build_phrase_map(terms)
     phrase_prefix = build_phrase_prefix(phrase_map)
     structured_patterns = build_structured_patterns(terms)
     if not phrase_map and not structured_patterns:
         return {"issues": []}
 
-    all_entries = fetch_all_entries()
+    exclude_keys = _get_blacklist_exclude_keys() + _get_non_term_exclude_keys()
+    all_entries = fetch_all_entries(exclude_keys=exclude_keys)
     issues = []
     seen = set()
 
     for entry in all_entries:
+        if is_blacklisted_key(entry.get("key", "")) or is_non_term_key(entry.get("key", "")):
+            continue
         en_text = entry["en_us"] or ""
         zh_actual = entry["zh_cn"] or ""
         generated, matched_terms, all_ok, match_found = generate_zh(
-            en_text, phrase_map, blacklist, phrase_prefix, zh_actual=zh_actual,
+            en_text, phrase_map, phrase_prefix, zh_actual=zh_actual,
             structured_patterns=structured_patterns,
             entry_key=entry.get("key", ""), entry_en=en_text,
             entry_zh=zh_actual,
@@ -733,11 +879,11 @@ def api_scan_entries(term: Term):
     if not found:
         terms.append(term)
 
-    blacklist = set(e.lower() for e in load_blacklist())
     phrase_map = build_phrase_map(terms)
     phrase_prefix = build_phrase_prefix(phrase_map)
     structured_patterns = build_structured_patterns(terms)
-    entries = fetch_entries_by_en_term(term.en)
+    search_en = term.en[0] if term.en else ""
+    entries = fetch_entries_by_en_term(search_en)
     results = []
 
     for entry in entries:

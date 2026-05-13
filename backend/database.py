@@ -1,14 +1,25 @@
 import json
+import re
 import sqlite3
 import os
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Minecraft.db")
+ORIGIN_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "origin.db")
 TERMS_DB_PATH = os.path.join(os.path.dirname(__file__), "terms.db")
+
+VIEW26_NAME = '_v26'
+_SCHEMA_CACHE: dict | None = None
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    global _SCHEMA_CACHE
+    path = DB_PATH if os.path.exists(DB_PATH) else ORIGIN_DB_PATH
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.create_function("REGEXP", 2, lambda pattern, value: bool(re.search(pattern, str(value))) if value else False)
+    if _SCHEMA_CACHE is None:
+        _SCHEMA_CACHE = _detect_schema(conn)
+        _ensure_view26(conn, _SCHEMA_CACHE)
     return conn
 
 
@@ -18,23 +29,89 @@ def get_terms_connection():
     return conn
 
 
-def fetch_entries(page: int = 1, page_size: int = 50, search: str = "", version: str = "", sort: str = "", key_prefix: str = ""):
+def _detect_schema(conn) -> dict:
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    if 'vanilla_keys' in tables:
+        return {'type': 'vanilla', 'table': 'vanilla_keys', 'ver_col': 'version_start', 'ver_order': 'version_start'}
+    elif 'translations' in tables:
+        return {'type': 'translations', 'table': 'translations', 'ver_col': 'version', 'ver_order': 'version'}
+    return {'type': None, 'table': 'vanilla_keys', 'ver_col': 'version_start', 'ver_order': 'version_start'}
+
+
+def _schema() -> dict:
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE is None:
+        c = get_connection()
+        c.close()
+    return _SCHEMA_CACHE
+
+
+def _ensure_view26(conn, s: dict):
+    """Create a unified VIEW _v26 that filters to version 26.1.2 with normalized columns."""
+    conn.execute(f"DROP VIEW IF EXISTS {VIEW26_NAME}")
+    if s['type'] == 'translations':
+        conn.execute(f"""
+            CREATE VIEW {VIEW26_NAME} AS
+            SELECT rowid, key, en_us, zh_cn,
+                   version AS version_start, version AS version_end,
+                   category, 0 AS changes
+            FROM translations
+            WHERE version = '26.1.2'
+        """)
+    else:
+        conn.execute(f"""
+            CREATE VIEW {VIEW26_NAME} AS
+            SELECT rowid, key, en_us, zh_cn,
+                   '26.1.2' AS version_start, '26.1.2' AS version_end,
+                   category, changes
+            FROM vanilla_keys
+            WHERE version_start <= '26.1.2' AND version_end >= '26.1.2'
+        """)
+    conn.commit()
+
+
+def fetch_entries(page: int = 1, page_size: int = 50, search: str = "", version: str = "", sort: str = "", key_prefix: str = "", exclude_keys: list[str] | None = None):
     conn = get_connection()
     try:
         conditions = []
         params = []
         if search:
-            conditions.append("(en_us LIKE ? OR zh_cn LIKE ? OR key LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+            FIELD_RE = re.compile(r'(?:^|\s+)(key|en_us|zh_cn):\s*')
+            field_conds = []
+            plain_parts = []
+            matches = list(FIELD_RE.finditer(search))
+            for i, m in enumerate(matches):
+                if i == 0 and m.start() > 0:
+                    txt = search[:m.start()].strip()
+                    if txt:
+                        plain_parts.append(txt)
+                field = m.group(1)
+                val_start = m.end()
+                if i + 1 < len(matches):
+                    value = search[val_start:matches[i+1].start()].strip()
+                else:
+                    value = search[val_start:].strip()
+                if value:
+                    field_conds.append((field, value))
+            if not matches and search.strip():
+                plain_parts.append(search.strip())
+            for field, value in field_conds:
+                conditions.append(f"{field} REGEXP ?")
+                params.append(value)
+            if plain_parts:
+                plain_text = ' '.join(plain_parts)
+                conditions.append("(en_us LIKE ? OR zh_cn LIKE ? OR key LIKE ?)")
+                params.extend([f"%{plain_text}%", f"%{plain_text}%", f"%{plain_text}%"])
         if key_prefix:
             conditions.append("key LIKE ?")
             params.append(f"{key_prefix}%")
-        if version:
-            conditions.append("(version_start <= ? AND version_end >= ?)")
-            params.extend([version, version])
+        if exclude_keys:
+            placeholders = ",".join("?" * len(exclude_keys))
+            conditions.append(f"key NOT IN ({placeholders})")
+            params.extend(exclude_keys)
 
         where = " AND ".join(conditions) if conditions else "1=1"
-        count_sql = f"SELECT COUNT(*) FROM vanilla_keys WHERE {where}"
+        count_sql = f"SELECT COUNT(*) FROM {VIEW26_NAME} WHERE {where}"
         total = conn.execute(count_sql, params).fetchone()[0]
 
         if sort == "en":
@@ -47,7 +124,7 @@ def fetch_entries(page: int = 1, page_size: int = 50, search: str = "", version:
             order_clause = "key, version_start"
 
         offset = (page - 1) * page_size
-        sql = f"SELECT rowid, * FROM vanilla_keys WHERE {where} ORDER BY {order_clause} LIMIT ? OFFSET ?"
+        sql = f"SELECT * FROM {VIEW26_NAME} WHERE {where} ORDER BY {order_clause} LIMIT ? OFFSET ?"
         rows = conn.execute(sql, params + [page_size, offset]).fetchall()
 
         entries = [dict(r) for r in rows]
@@ -60,7 +137,7 @@ def fetch_entry_detail(key: str):
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT rowid, * FROM vanilla_keys WHERE key = ? ORDER BY version_start", (key,)
+            f"SELECT * FROM {VIEW26_NAME} WHERE key = ? ORDER BY version_start", (key,)
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -68,14 +145,20 @@ def fetch_entry_detail(key: str):
 
 
 def fetch_entries_by_en_term(term: str):
-    """Fetch all entries where en_us contains the given term."""
+    """Fetch all entries where en_us contains the given term as a whole word."""
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT rowid, * FROM vanilla_keys WHERE en_us LIKE ? ORDER BY key, version_start",
+            f"SELECT * FROM {VIEW26_NAME} WHERE en_us LIKE ? ORDER BY key, version_start",
             (f"%{term}%",),
         ).fetchall()
-        return [dict(r) for r in rows]
+        target = term.lower().strip()
+        result = []
+        for r in rows:
+            en = r["en_us"] or ""
+            if any(w.lower().strip(",.!?;:\"'()[]{}") == target for w in en.split()):
+                result.append(dict(r))
+        return result
     finally:
         conn.close()
 
@@ -84,19 +167,26 @@ def get_all_keys():
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT DISTINCT key FROM vanilla_keys ORDER BY key"
+            f"SELECT DISTINCT key FROM {VIEW26_NAME} ORDER BY key"
         ).fetchall()
         return [r["key"] for r in rows]
     finally:
         conn.close()
 
 
-def fetch_all_entries():
+def fetch_all_entries(exclude_keys: list[str] | None = None):
     """Fetch all entries without pagination."""
     conn = get_connection()
     try:
+        conditions = []
+        params = []
+        if exclude_keys:
+            placeholders = ",".join("?" * len(exclude_keys))
+            conditions.append(f"key NOT IN ({placeholders})")
+            params.extend(exclude_keys)
+        where = " AND ".join(conditions) if conditions else "1=1"
         rows = conn.execute(
-            "SELECT rowid, * FROM vanilla_keys ORDER BY key, version_start"
+            f"SELECT * FROM {VIEW26_NAME} WHERE {where} ORDER BY key, version_start", params
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -107,7 +197,7 @@ def get_versions_for_key(key: str):
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT version_start, version_end, zh_cn, en_us, changes FROM vanilla_keys WHERE key = ? ORDER BY version_start",
+            f"SELECT version_start, version_end, zh_cn, en_us, changes FROM {VIEW26_NAME} WHERE key = ? ORDER BY version_start",
             (key,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -130,7 +220,7 @@ def fetch_entries_by_key_prefixes(prefixes: list[str], exclude_prefix: str = "",
             conditions.append("key NOT LIKE ?")
             params.append(f"{exclude_prefix}%")
         where = " AND ".join(conditions)
-        sql = f"SELECT rowid, * FROM vanilla_keys WHERE {where} ORDER BY CASE {order_case} ELSE 999 END, key, version_start LIMIT ?"
+        sql = f"SELECT * FROM {VIEW26_NAME} WHERE {where} ORDER BY CASE {order_case} ELSE 999 END, key, version_start LIMIT ?"
         rows = conn.execute(sql, params + [limit]).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -185,7 +275,7 @@ def init_terms_table():
         conn.close()
 
 
-def fetch_terms(search: str = "", label: str = "", page: int = 1, page_size: int = 9999) -> dict:
+def fetch_terms(search: str = "", label: str = "", page: int = 1, page_size: int = 9999, sort: str = "") -> dict:
     conn = get_terms_connection()
     try:
         conditions = []
@@ -200,7 +290,8 @@ def fetch_terms(search: str = "", label: str = "", page: int = 1, page_size: int
         count_sql = f"SELECT COUNT(*) FROM terms WHERE {where}"
         total = conn.execute(count_sql, params).fetchone()[0]
         offset = (page - 1) * page_size
-        sql = f"SELECT * FROM terms WHERE {where} ORDER BY en LIMIT ? OFFSET ?"
+        order = "updated_at DESC" if sort == "time" else "en"
+        sql = f"SELECT * FROM terms WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?"
         rows = conn.execute(sql, params + [page_size, offset]).fetchall()
         terms = [dict(r) for r in rows]
         return {"terms": terms, "total": total, "page": page, "page_size": page_size}
@@ -295,15 +386,28 @@ def get_all_term_labels() -> list[str]:
 
 
 def replace_all_terms(term_dicts: list[dict]):
-    """Truncate and bulk insert all terms."""
+    """Truncate and bulk insert all terms, preserving timestamps for existing rows."""
     conn = get_terms_connection()
     try:
+        existing = {}
+        for r in conn.execute("SELECT en, created_at, updated_at FROM terms").fetchall():
+            existing[r["en"]] = {"created_at": r["created_at"], "updated_at": r["updated_at"]}
         conn.execute("DELETE FROM terms")
+        from datetime import datetime
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         for td in term_dicts:
+            prev = existing.get(td["en"])
+            if prev:
+                created = prev["created_at"]
+                updated = prev["updated_at"]
+            else:
+                created = now
+                updated = now
             conn.execute(
-                "INSERT INTO terms (en, zh, scope, changes, variable_pos, labels) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO terms (en, zh, scope, changes, variable_pos, labels, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (td["en"], td["zh"], td.get("scope"),
-                 td.get("changes"), td.get("variable_pos", 0), td.get("labels", "[]")),
+                 td.get("changes"), td.get("variable_pos", 0), td.get("labels", "[]"),
+                 created, updated),
             )
         conn.commit()
     finally:

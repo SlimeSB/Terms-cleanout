@@ -13,7 +13,7 @@
 │   ├── schemas.py        # 数据模型 (en/zh 支持数组)
 │   ├── ai_agent.py       # AI Agent (OpenAI 兼容 API)
 │   ├── terms.json        # 术语持久化 (自动生成)
-│   └── blacklist.json    # 黑名单 (自动生成)
+│   └── blacklist.json    # 黑名单 (按key, 自动生成)
 ├── frontend/             # Vite + React + Tailwind CSS
 ├── start.bat             # 一键启动 (双击运行)
 └── Minecraft.db          # 语言文件数据库
@@ -63,9 +63,9 @@ python cli.py import-terms <file>    # 导入术语 JSON（自动合并版本）
 python cli.py label <en> <label>     # 给术语添加标签
 python cli.py unlabel <en> <label>   # 移除术语标签
 python cli.py list-labels            # 列出所有标签
-python cli.py list-blacklist         # 列出黑名单
-python cli.py add-blacklist <en>     # 添加词到黑名单
-python cli.py del-blacklist <en>     # 从黑名单移除
+python cli.py list-blacklist                  # 列出黑名单（按key分组）
+python cli.py add-blacklist <en> --key <key>  # 添加词到黑名单（--key 指定条目key）
+python cli.py del-blacklist <en> [--key <key>] # 从黑名单移除（--key 可选）
 ```
 
 ### 交互式 REPL
@@ -81,7 +81,7 @@ del        删除术语: del <en>
 scan       扫描比对: scan <en>
 label      添加标签: label <en> <label>
 unlabel    移除标签: unlabel <en> <label>
-blacklist  管理黑名单: blacklist [list|add <en>|del <en>]
+blacklist  管理黑名单: blacklist [list|add <en>|del <en>] [--key <key>]
 export     导出术语: export [文件名]
 import     导入术语: import [文件名]
 stats      显示统计

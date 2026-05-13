@@ -23,10 +23,6 @@ class TermImportPayload(BaseModel):
     terms: list[ImportTerm]
 
 
-class TermExportPayload(BaseModel):
-    terms: list[Term]
-
-
 class ScanResult(BaseModel):
     en: str
     zh_actual: str

@@ -1,3 +1,10 @@
 .env
 **/__pycache__
 *.db
+*.bak
+*.bak??
+*.debug_tmp
+.venv/
+venv/
+node_modules/
+dist/

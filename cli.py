@@ -16,14 +16,12 @@ import json
 import os
 import sys
 import cmd
-import shutil
-from typing import Optional
 
 import click
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.markdown import Markdown
+from rich.prompt import Prompt, Confirm
 
 if sys.platform == "win32":
     import io
@@ -32,14 +30,11 @@ if sys.platform == "win32":
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
 
-from database import fetch_entries, fetch_entries_by_en_term, fetch_entries_by_key_prefixes, get_versions_for_key, init_terms_table, find_term_by_en, update_term_by_id, get_all_term_labels, fetch_terms
+from database import fetch_entries, fetch_entries_by_en_term, fetch_entries_by_key_prefixes, fetch_all_entries, get_versions_for_key, init_terms_table, find_term_by_en, update_term_by_id, get_all_term_labels
 from schemas import Term
-from main import load_terms, save_terms, load_blacklist, save_blacklist, build_term_map, build_phrase_map, build_phrase_prefix, build_structured_patterns, scope_matches, generate_zh, extend_term_version_from_db
+from main import load_terms, save_terms, load_blacklist, save_blacklist, build_phrase_map, build_phrase_prefix, build_structured_patterns, generate_zh, extend_term_version_from_db, merge_term_into_library, is_structured_term
 
-try:
-    from backend import ai_agent
-except ImportError:
-    import ai_agent as ai_agent
+import ai_agent
 
 console = Console()
 
@@ -124,12 +119,167 @@ def print_blacklist_table(bl: list[str]):
     if not bl:
         console.print("[yellow]黑名单为空[/yellow]")
         return
-    table = Table(title="黑名单", title_style="bold cyan")
-    table.add_column("屏蔽词", style="red")
-    for w in bl:
-        table.add_row(w)
+    table = Table(title="黑名单 (key 模式)", title_style="bold cyan")
+    table.add_column("模式")
+    for p in bl:
+        table.add_row(p)
     console.print(table)
-    console.print(f"[dim]共 {len(bl)} 个屏蔽词[/dim]")
+    console.print(f"[dim]共 {len(bl)} 个模式[/dim]")
+
+
+# ─── Interactive scan fix helpers ──────────────────────────────────────────
+
+
+def _interactive_scan_fix(results: list[dict]):
+    """交互式修复 scan 不匹配条目（仅处理 all_ok=True 的条目）"""
+    mismatches = [r for r in results if not r["_match"] and r["_all_ok"]]
+    if not mismatches:
+        return
+
+    if not Confirm.ask(f"发现 {len(mismatches)} 条不匹配。是否修复？", default=False):
+        return
+
+    terms = load_terms()
+
+    for res in mismatches:
+        key = res["key"]
+        en_text = res["_en_text"]
+        zh_actual = res["zh_cn"] or ""
+        generated = res["_generated"]
+        matched_term_names = res["_matched_terms"]
+        ver_start = res.get("version_start", "")
+        ver_end = res.get("version_end", "")
+
+        console.print()
+        console.print(Panel(
+            f"[dim]Key:[/dim] {key}\n"
+            f"[yellow]EN:[/yellow] {en_text}\n"
+            f"[blue]实际zh:[/blue] {zh_actual}\n"
+            f"[magenta]生成zh:[/magenta] {generated}\n"
+            f"[cyan]匹配术语:[/cyan] {', '.join(matched_term_names) if matched_term_names else '-'}",
+            title="不匹配条目",
+            border_style="yellow",
+        ))
+
+        # ── 可能的原因分析 ──
+        console.print("[bold]可能的原因分析：[/bold]")
+        total_zh_len = 0
+        for en_str in matched_term_names:
+            found = None
+            for t in terms:
+                t_ens = [e.lower() for e in t.en]
+                if any(p.strip().lower() in t_ens for p in en_str.split("|")):
+                    found = t
+                    break
+            if found:
+                zh_strs = [z for z in found.zh]
+                total_zh_len += sum(len(z) for z in zh_strs)
+                console.print(f"  - 术语 [yellow]\"{' | '.join(found.en)}\"[/yellow] 的 zh={zh_strs}")
+            else:
+                console.print(f"  - 术语 \"{en_str}\"（未在术语库中找到具体对象）")
+
+        if total_zh_len > len(zh_actual) and zh_actual:
+            console.print(f"  [yellow]→ 提示: zh 所有选项拼接后 ({total_zh_len}字) 比实际zh ({len(zh_actual)}字) 长，可能zh太长/不匹配[/yellow]")
+        elif total_zh_len < len(zh_actual) and zh_actual:
+            console.print(f"  [yellow]→ 提示: zh 所有选项拼接后 ({total_zh_len}字) 比实际zh ({len(zh_actual)}字) 短，可能缺zh变体[/yellow]")
+
+        if generated and zh_actual:
+            if len(generated) > len(zh_actual):
+                console.print(f"  [yellow]→ 生成zh比实际zh长（\"{generated}\" vs \"{zh_actual}\"），可尝试加更短的zh变体[/yellow]")
+            elif len(generated) < len(zh_actual):
+                console.print(f"  [yellow]→ 生成zh比实际zh短（\"{generated}\" vs \"{zh_actual}\"），可尝试加更长的zh变体[/yellow]")
+
+        # ── 操作选择 ──
+        console.print()
+        console.print("[bold]操作：[/bold]")
+        console.print("  1) 修改现有术语")
+        console.print("  2) 添加短语术语")
+        console.print("  3) 跳过")
+        choice = Prompt.ask("请选择", choices=["1", "2", "3"], default="3")
+
+        if choice == "1":
+            _fix_modify_term(matched_term_names, terms)
+            terms = load_terms()  # reload after modification
+        elif choice == "2":
+            _fix_add_phrase_term(en_text, generated, ver_start, ver_end)
+            terms = load_terms()
+        else:
+            console.print("[dim]已跳过[/dim]")
+
+
+def _fix_modify_term(matched_term_names: list[str], terms: list[Term]):
+    """Option 1: modify an existing term's zh values."""
+    seen_ids = set()
+    matched_objs = []
+    for en_str in matched_term_names:
+        parts = [p.strip().lower() for p in en_str.split("|")]
+        for t in terms:
+            tid = id(t)
+            if tid in seen_ids:
+                continue
+            t_ens = [e.lower() for e in t.en]
+            if any(p in t_ens for p in parts):
+                matched_objs.append(t)
+                seen_ids.add(tid)
+
+    if not matched_objs:
+        console.print("[red]未找到匹配的术语对象[/red]")
+        return
+
+    console.print(f"\n[bold]找到 {len(matched_objs)} 个相关术语:[/bold]")
+    for i, t in enumerate(matched_objs, 1):
+        console.print(f"  {i}. [yellow]{' | '.join(t.en)}[/yellow] → [blue]{' | '.join(t.zh)}[/blue] (scope: {format_scope_for_display(t.scope)})")
+
+    idx = Prompt.ask("选择要修改的术语编号", choices=[str(i) for i in range(1, len(matched_objs) + 1)], default="1")
+    selected = matched_objs[int(idx) - 1]
+
+    new_zh_input = Prompt.ask(
+        f"术语 [yellow]{' | '.join(selected.en)}[/yellow] 当前 zh=[\"{'\", \"'.join(selected.zh)}\"]\n输入新的 zh（用 | 分隔，留空不修改）",
+        default="",
+    )
+
+    if new_zh_input.strip():
+        new_zh = [z.strip() for z in new_zh_input.split("|") if z.strip()]
+        if new_zh:
+            selected.zh = new_zh
+            save_terms(terms)
+            console.print(f"[green]→ 已更新 {', '.join(selected.en)} 的 zh 为 {new_zh}[/green]")
+
+
+def _fix_add_phrase_term(en_text: str, generated: str, ver_start: str, ver_end: str):
+    """Option 2: add a new phrase term."""
+    console.print(f"\n[bold]添加短语术语:[/bold]")
+
+    from database import term_version_to_scope
+
+    en_input = Prompt.ask("英文短语", default=en_text)
+    zh_input = Prompt.ask("中文翻译", default=generated)
+
+    # Auto-detect scope from entry version_start only
+    scope = None
+    from database import term_version_to_scope
+    scope = term_version_to_scope(ver_start, ver_end)
+    if scope:
+        scope = json.loads(scope)
+
+    scope_str = format_scope_for_display(scope)
+    console.print(f"  scope: [green]{scope_str}[/green]")
+
+    if Confirm.ask("添加确认？", default=True):
+        en_list = [e.strip() for e in en_input.split("|") if e.strip()]
+        zh_list = [z.strip() for z in zh_input.split("|") if z.strip()]
+        term = Term(en=en_list, zh=zh_list, scope=scope)
+        extend_term_version_from_db(term)
+        existing, is_new, is_merged, is_split = merge_term_into_library(term)
+        save_terms(existing)
+        if is_new or is_split:
+            console.print(f"[green]✓ 已添加术语 \"{en_input}\" → [{', '.join(zh_list)}][/green]")
+        elif is_merged:
+            console.print(f"[green]✓ 已合并术语 \"{en_input}\" → [{', '.join(zh_list)}][/green]")
+        else:
+            console.print(f"[yellow]术语已存在: \"{en_input}\"[/yellow]")
+    else:
+        console.print("[dim]已取消[/dim]")
 
 
 # ─── click commands ───────────────────────────────────────────────────────
@@ -153,6 +303,8 @@ def search(query, page, version):
     result = fetch_entries(page=page, page_size=50, search=query, version=version)
     console.print(f"[dim]共 {result['total']} 条, 当前第 {page} 页[/dim]")
     print_entries_table(result["entries"])
+    if result["total"] > result["page_size"]:
+        console.print("[dim]使用 search <词> -p <页码> 翻页[/dim]")
 
 
 @cli.command()
@@ -181,6 +333,24 @@ def list_terms():
     console.print(f"[dim]共 {len(terms)} 条术语[/dim]")
 
 
+@cli.command(name="ghost-terms")
+def ghost_terms():
+    """列出幽灵术语（术语库中有但语言文件中从不出现的）"""
+    terms = load_terms()
+    if not terms:
+        console.print("[yellow]术语库为空[/yellow]")
+        return
+    all_entries = fetch_all_entries()
+    all_text = " ".join(e["en_us"] or "" for e in all_entries).lower()
+    ghosts = [t for t in terms if not is_structured_term(t) and not any(v.strip().lower() in all_text for v in t.en if v.strip())]
+    if not ghosts:
+        console.print("[green]无幽灵术语[/green]")
+        console.print(f"[dim]共检查 {len(terms)} 条术语[/dim]")
+        return
+    print_term_table(ghosts, title=f"幽灵术语 ({len(ghosts)}/{len(terms)})")
+    console.print(f"[yellow]共 {len(ghosts)} 条幽灵术语[/yellow]")
+
+
 @cli.command(name="add-term")
 @click.argument("en")
 @click.argument("zh")
@@ -199,46 +369,17 @@ def add_term(en, zh, scope_version, scope_key):
             scope["key"] = scope_key
     term = Term(en=en_list, zh=zh_list, scope=scope)
     extend_term_version_from_db(term)
-    existing = load_terms()
-
-    in_en_set = set(e.lower() for e in term.en)
-    in_zh_set = set(term.zh)
-
-    for t in existing:
-        if set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set and t.variable_pos == term.variable_pos:
-            save_terms(existing)
-            console.print(f"[green]术语已存在:[/green] {en} → {zh}")
-            return
-
-    for t in existing:
-        existing_en_set = set(e.lower() for e in t.en)
-        existing_zh_set = set(t.zh)
-        if not (existing_en_set & in_en_set or existing_zh_set & in_zh_set):
-            continue
-        new_ens = [e for e in term.en if e.lower() not in existing_en_set]
-        new_zhs = [z for z in term.zh if z not in existing_zh_set]
-        if t.variable_pos == term.variable_pos and t.scope == term.scope:
-            if new_ens:
-                t.en.extend(new_ens)
-            if new_zhs:
-                t.zh.extend(new_zhs)
-            save_terms(existing)
-            msg = f"[green]术语已合并:[/green] {en} → {zh}"
-            if new_ens:
-                msg += f" (新增英文: {', '.join(new_ens)})"
-            if new_zhs:
-                msg += f" (新增中文: {', '.join(new_zhs)})"
-            console.print(msg)
-            return
-        else:
-            existing.append(term)
-            save_terms(existing)
-            console.print(f"[green]术语已添加(拆分):[/green] {en} → {zh}")
-            return
-
-    existing.append(term)
+    existing, is_new, is_merged, is_split = merge_term_into_library(term)
     save_terms(existing)
-    console.print(f"[green]术语已添加:[/green] {en} → {zh}")
+    if is_new:
+        console.print(f"[green]术语已添加:[/green] {en} → {zh}")
+    elif is_merged:
+        msg = f"[green]术语已合并:[/green] {en} → {zh}"
+        console.print(msg)
+    elif is_split:
+        console.print(f"[green]术语已添加(拆分):[/green] {en} → {zh}")
+    else:
+        console.print(f"[green]术语已存在:[/green] {en} → {zh}")
 
 
 @cli.command(name="del-term")
@@ -257,10 +398,10 @@ def del_term(en):
 @cli.command()
 @click.argument("en")
 @click.option("--limit", "-l", default=50, type=int)
-def scan(en, limit):
+@click.option("--interactive", "-i", is_flag=True, default=False, help="交互式修复不匹配条目")
+def scan(en, limit, interactive):
     """扫描包含某英文词的所有词条，与术语库比对（支持结构化模式）"""
     terms = load_terms()
-    blacklist = set(e.lower() for e in get_blacklist())
     phrase_map = build_phrase_map(terms)
     phrase_prefix = build_phrase_prefix(phrase_map)
     structured_patterns = build_structured_patterns(terms)
@@ -279,11 +420,12 @@ def scan(en, limit):
     table.add_column("生成zh", style="magenta")
     table.add_column("状态")
 
+    results = []
     for e in entries:
         en_text = e["en_us"] or ""
         zh_actual = e["zh_cn"] or ""
-        generated, _, _, _ = generate_zh(
-            en_text, phrase_map, blacklist, phrase_prefix,
+        generated, matched_terms, all_ok, _ = generate_zh(
+            en_text, phrase_map, phrase_prefix,
             structured_patterns=structured_patterns,
             entry_key=e.get("key", ""), entry_en=en_text, entry_zh=zh_actual,
             entry_ver_start=e.get("version_start", ""), entry_ver_end=e.get("version_end", ""),
@@ -295,9 +437,23 @@ def scan(en, limit):
             mismatched += 1
         status = "[green]OK[/green]" if match else "[red]XX[/red]"
         table.add_row(e["key"][:50], en_text[:40], zh_actual[:40], generated[:40], status)
+        results.append({
+            "key": e["key"],
+            "zh_cn": zh_actual,
+            "version_start": e.get("version_start", ""),
+            "version_end": e.get("version_end", ""),
+            "_en_text": en_text,
+            "_generated": generated,
+            "_matched_terms": matched_terms,
+            "_all_ok": all_ok,
+            "_match": match,
+        })
 
     console.print(table)
     console.print(f"\n[green]匹配: {matched}[/green]  [red]不匹配: {mismatched}[/red]  / 总计: {len(entries)}")
+
+    if interactive and mismatched > 0:
+        _interactive_scan_fix(results)
 
 
 @cli.command()
@@ -343,21 +499,27 @@ def import_terms(file):
 @cli.command()
 def stats():
     """显示统计信息"""
-    from database import get_connection
+    from database import get_connection, _schema
     conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) FROM vanilla_keys").fetchone()[0]
-    keys = conn.execute("SELECT COUNT(DISTINCT key) FROM vanilla_keys").fetchone()[0]
-    changed = conn.execute("SELECT COUNT(*) FROM vanilla_keys WHERE changes=1").fetchone()[0]
+    s = _schema()
+    tbl = s['table']
+    total = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+    keys = conn.execute(f"SELECT COUNT(DISTINCT key) FROM {tbl}").fetchone()[0]
+    if s['type'] == 'translations':
+        changed = 0
+    else:
+        changed = conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE changes=1").fetchone()[0]
     conn.close()
     terms = load_terms()
     labels = get_all_term_labels()
     bl = get_blacklist()
+    bl_count = len(bl)
     console.print(Panel.fit(
         f"[bold]词条总数:[/bold] {total}\n"
         f"[bold]唯一Key:[/bold] {keys}\n"
         f"[bold]有变化的词条:[/bold] {changed}\n"
         f"[bold]术语库:[/bold] {len(terms)} 条\n"
-        f"[bold]黑名单:[/bold] {len(bl)} 个\n"
+        f"[bold]黑名单:[/bold] {bl_count} 个模式\n"
         f"[bold]标签:[/bold] {', '.join(labels) if labels else '无'}",
         title="[*] 统计信息",
         border_style="cyan",
@@ -426,30 +588,29 @@ def list_blacklist():
 
 
 @cli.command(name="add-blacklist")
-@click.argument("en")
-def add_blacklist(en):
-    """添加词到黑名单"""
-    word = en.strip().lower()
+@click.argument("pattern")
+def add_blacklist(pattern):
+    """添加 key 模式到黑名单（正则，匹配的条目完全跳过术语检查）"""
     bl = get_blacklist()
-    if word in bl:
-        console.print(f"[yellow]'{word}' 已在黑名单中[/yellow]")
+    if pattern in bl:
+        console.print(f"[yellow]'{pattern}' 已在黑名单中[/yellow]")
         return
-    bl.append(word)
+    bl.append(pattern)
     save_blacklist(bl)
-    console.print(f"[green]已添加 '{word}' 到黑名单[/green]")
+    console.print(f"[green]已添加黑名单模式: {pattern}[/green]")
 
 
 @cli.command(name="del-blacklist")
-@click.argument("en")
-def del_blacklist(en):
-    """从黑名单移除"""
-    word = en.strip().lower()
+@click.argument("pattern")
+def del_blacklist(pattern):
+    """从黑名单移除 key 模式"""
     bl = get_blacklist()
-    if word not in bl:
-        console.print(f"[red]未找到: {word}[/red]")
+    if pattern not in bl:
+        console.print(f"[red]未找到: {pattern}[/red]")
         return
-    save_blacklist([w for w in bl if w != word])
-    console.print(f"[green]已从黑名单移除: {word}[/green]")
+    bl = [p for p in bl if p != pattern]
+    save_blacklist(bl)
+    console.print(f"[green]已移除黑名单模式: {pattern}[/green]")
 
 
 # ─── AI Agent commands ────────────────────────────────────────────────────
@@ -552,13 +713,8 @@ def batch_suggest_cmd(count, batch_size):
             en_list = [r["en"]] if isinstance(r["en"], str) else r["en"]
             zh_list = [r["zh"]] if isinstance(r["zh"], str) else r["zh"]
             term = Term(en=en_list, zh=zh_list)
-            exists = any(
-                set(e.lower() for e in t.en) == set(e.lower() for e in term.en)
-                and set(t.zh) == set(term.zh)
-                for t in existing
-            )
-            if not exists:
-                existing.append(term)
+            existing, is_new, is_merged, is_split = merge_term_into_library(term, existing)
+            if is_new or is_split or is_merged:
                 added += 1
         save_terms(existing)
         console.print(f"[green]已添加 {added} 条新术语[/green]")
@@ -571,7 +727,6 @@ def scan_inconsistencies(limit):
     if not check_ai_available():
         return
     terms = load_terms()
-    blacklist = set(e.lower() for e in get_blacklist())
     phrase_map = build_phrase_map(terms)
     phrase_prefix = build_phrase_prefix(phrase_map)
     structured_patterns = build_structured_patterns(terms)
@@ -585,7 +740,7 @@ def scan_inconsistencies(limit):
         en_text = e["en_us"] or ""
         zh_actual = e["zh_cn"] or ""
         generated, matched_terms, all_ok, match_found = generate_zh(
-            en_text, phrase_map, blacklist, phrase_prefix,
+            en_text, phrase_map, phrase_prefix,
             structured_patterns=structured_patterns,
             entry_key=e.get("key", ""), entry_en=en_text, entry_zh=zh_actual,
             entry_ver_start=e.get("version_start", ""), entry_ver_end=e.get("version_end", ""),
@@ -642,10 +797,11 @@ class TermREPL(cmd.Cmd):
             "scan": "扫描比对: scan <en>",
             "label": "添加标签: label <en> <label>",
             "unlabel": "移除标签: unlabel <en> <label>",
-            "blacklist": "管理黑名单: blacklist [list|add <en>|del <en>]",
+            "blacklist": "管理黑名单: blacklist [list|add <en>|del <en>] (支持 --key)",
             "export": "导出术语: export [文件名]",
             "import": "导入术语: import [文件名]",
             "stats": "显示统计",
+            "ghost": "列出幽灵术语（术语库中有但语言文件中没有的）",
             "agent": "AI Agent 交互模式",
             "exit": "退出",
         }
@@ -667,38 +823,25 @@ class TermREPL(cmd.Cmd):
         query = args[0] if args else ""
         page = 1
         version = ""
-        for i, a in enumerate(args[1:], 1):
-            if a in ("-p", "--page") and i + 1 < len(args):
+        i = 1
+        while i < len(args):
+            if args[i] in ("-p", "--page") and i + 1 < len(args):
                 page = int(args[i + 1])
-            elif a in ("-v", "--version") and i + 1 < len(args):
+                i += 1
+            elif args[i] in ("-v", "--version") and i + 1 < len(args):
                 version = args[i + 1]
-        result = fetch_entries(page=page, page_size=50, search=query, version=version)
-        console.print(f"[dim]共 {result['total']} 条[/dim]")
-        print_entries_table(result["entries"])
-        if result["total"] > result["page_size"]:
-            console.print("[dim]使用 search <词> -p <页码> 翻页[/dim]")
+                i += 1
+            i += 1
+        search(query, page, version)
 
     def do_detail(self, arg):
         if not arg.strip():
             console.print("[red]用法: detail <key>[/red]")
             return
-        versions = get_versions_for_key(arg.strip())
-        if not versions:
-            console.print(f"[red]未找到: {arg}[/red]")
-            return
-        console.print(f"[bold cyan]{arg}[/bold cyan]")
-        for v in versions:
-            changes = " [!]" if v.get("changes") else ""
-            console.print(
-                f"  [{v['version_start']} - {v['version_end']}] "
-                f"en: [yellow]{v['en_us']}[/yellow] "
-                f"zh: [blue]{v['zh_cn']}[/blue]{changes}"
-            )
+        detail(arg.strip())
 
     def do_list(self, arg):
-        terms = load_terms()
-        print_term_table(terms)
-        console.print(f"[dim]共 {len(terms)} 条术语[/dim]")
+        list_terms()
 
     def do_add(self, arg):
         parts = arg.split()
@@ -707,225 +850,68 @@ class TermREPL(cmd.Cmd):
             return
         en = parts[0]
         zh = parts[1]
-        scope = None
-        if "--scope-version" in parts:
-            si = parts.index("--scope-version")
-            sv = parts[si + 1] if si + 1 < len(parts) else ""
-            if sv:
-                scope = {"version": sv}
-        if "--scope-key" in parts:
-            ki = parts.index("--scope-key")
-            sk = parts[ki + 1] if ki + 1 < len(parts) else ""
-            if sk:
-                if scope is None:
-                    scope = {}
-                scope["key"] = sk
-        en_list = [e.strip() for e in en.split("|") if e.strip()]
-        zh_list = [z.strip() for z in zh.split("|") if z.strip()]
-        term = Term(en=en_list, zh=zh_list, scope=scope)
-        extend_term_version_from_db(term)
-        existing = load_terms()
-
-        in_en_set = set(e.lower() for e in term.en)
-        in_zh_set = set(term.zh)
-
-        for t in existing:
-            if set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set and t.variable_pos == term.variable_pos:
-                save_terms(existing)
-                console.print(f"[green]术语已存在[/green]")
-                return
-
-        for t in existing:
-            existing_en_set = set(e.lower() for e in t.en)
-            existing_zh_set = set(t.zh)
-            if not (existing_en_set & in_en_set or existing_zh_set & in_zh_set):
-                continue
-            new_ens = [e for e in term.en if e.lower() not in existing_en_set]
-            new_zhs = [z for z in term.zh if z not in existing_zh_set]
-            if t.variable_pos == term.variable_pos and t.scope == term.scope:
-                if new_ens:
-                    t.en.extend(new_ens)
-                if new_zhs:
-                    t.zh.extend(new_zhs)
-                save_terms(existing)
-                console.print(f"[green]术语已合并更新[/green]")
-                return
-            else:
-                existing.append(term)
-                save_terms(existing)
-                console.print(f"[green]术语已添加(拆分)[/green]")
-                return
-
-        existing.append(term)
-        save_terms(existing)
-        console.print(f"[green]术语已添加: {en} → {zh}[/green]")
+        scope_version = ""
+        scope_key = ""
+        i = 2
+        while i < len(parts):
+            if parts[i] == "--scope-version" and i + 1 < len(parts):
+                scope_version = parts[i + 1]
+                i += 1
+            elif parts[i] == "--scope-key" and i + 1 < len(parts):
+                scope_key = parts[i + 1]
+                i += 1
+            i += 1
+        add_term(en, zh, scope_version, scope_key)
 
     def do_del(self, arg):
         if not arg.strip():
             console.print("[red]用法: del <en>[/red]")
             return
-        existing = load_terms()
-        new_list = [t for t in existing if not term_matches_en(t, arg)]
-        if len(new_list) == len(existing):
-            console.print(f"[red]未找到: {arg}[/red]")
-            return
-        save_terms(new_list)
-        console.print(f"[green]已删除: {arg}[/green]")
+        del_term(arg.strip())
 
     def do_label(self, arg):
         parts = arg.split()
         if len(parts) < 2:
             console.print("[red]用法: label <en> <label>[/red]")
             return
-        en, lbl = parts[0], parts[1].strip().lower()
-        init_terms_table()
-        row = find_term_by_en(en)
-        if not row:
-            console.print(f"[red]未找到术语: {en}[/red]")
-            return
-        labels = json.loads(row["labels"]) if row.get("labels") else []
-        if lbl in labels:
-            console.print(f"[yellow]标签 '{lbl}' 已存在[/yellow]")
-            return
-        labels.append(lbl)
-        update_term_by_id(row["id"], labels=json.dumps(labels, ensure_ascii=False))
-        console.print(f"[green]已添加标签 '{lbl}' 到 {en}[/green]")
+        label(parts[0], parts[1])
 
     def do_unlabel(self, arg):
         parts = arg.split()
         if len(parts) < 2:
             console.print("[red]用法: unlabel <en> <label>[/red]")
             return
-        en, lbl = parts[0], parts[1].strip().lower()
-        init_terms_table()
-        row = find_term_by_en(en)
-        if not row:
-            console.print(f"[red]未找到术语: {en}[/red]")
-            return
-        labels = json.loads(row["labels"]) if row.get("labels") else []
-        if lbl not in labels:
-            console.print(f"[yellow]标签 '{lbl}' 不存在[/yellow]")
-            return
-        labels.remove(lbl)
-        update_term_by_id(row["id"], labels=json.dumps(labels, ensure_ascii=False))
-        console.print(f"[green]已从 {en} 移除标签 '{lbl}'[/green]")
+        unlabel(parts[0], parts[1])
 
     def do_scan(self, arg):
         if not arg.strip():
             console.print("[red]用法: scan <en>[/red]")
             return
-        en = arg.strip()
-        terms = load_terms()
-        blacklist = set(e.lower() for e in get_blacklist())
-        phrase_map = build_phrase_map(terms)
-        phrase_prefix = build_phrase_prefix(phrase_map)
-        structured_patterns = build_structured_patterns(terms)
-        entries = fetch_entries_by_en_term(en)[:100]
-        if not entries:
-            console.print("[yellow]无结果[/yellow]")
-            return
-        matched = mismatched = 0
-        table = Table(title=f"扫描 '{en}' ({len(entries)} 条)", title_style="bold cyan")
-        table.add_column("Key", style="dim")
-        table.add_column("en_us")
-        table.add_column("实际zh", style="blue")
-        table.add_column("生成zh", style="magenta")
-        table.add_column("状态")
-        for e in entries:
-            en_text = e["en_us"] or ""
-            zh_actual = e["zh_cn"] or ""
-            generated, _, _, _ = generate_zh(
-                en_text, phrase_map, blacklist, phrase_prefix,
-                structured_patterns=structured_patterns,
-                entry_key=e.get("key", ""), entry_en=en_text, entry_zh=zh_actual,
-                entry_ver_start=e.get("version_start", ""), entry_ver_end=e.get("version_end", ""),
-            )
-            match = generated == zh_actual
-            if match:
-                matched += 1
-            else:
-                mismatched += 1
-            status = "[green]OK[/green]" if match else "[red]XX[/red]"
-            table.add_row(e["key"][:50], en_text[:40], zh_actual[:40], generated[:40], status)
-        console.print(table)
-        console.print(f"\n[green]匹配: {matched}[/green]  [red]不匹配: {mismatched}[/red]  / {len(entries)}")
+        scan(arg.strip(), 100, True)
 
     def do_blacklist(self, arg):
-        args = arg.strip().split(maxsplit=1)
-        if not arg.strip() or (args and args[0] == "list"):
-            print_blacklist_table(get_blacklist())
-        elif args[0] == "add" and len(args) > 1:
-            word = args[1].strip().lower()
-            bl = get_blacklist()
-            if word in bl:
-                console.print(f"[yellow]'{word}' 已在黑名单中[/yellow]")
-                return
-            bl.append(word)
-            save_blacklist(bl)
-            console.print(f"[green]已添加 '{word}' 到黑名单[/green]")
-        elif args[0] == "del" and len(args) > 1:
-            word = args[1].strip().lower()
-            bl = get_blacklist()
-            if word not in bl:
-                console.print(f"[red]未找到: {word}[/red]")
-                return
-            save_blacklist([w for w in bl if w != word])
-            console.print(f"[green]已从黑名单移除: {word}[/green]")
+        import shlex
+        args = shlex.split(arg) if arg.strip() else []
+        if not args or args[0] == "list":
+            list_blacklist()
+        elif args[0] == "add" and len(args) >= 2:
+            add_blacklist(args[1])
+        elif args[0] == "del" and len(args) >= 2:
+            del_blacklist(args[1])
         else:
-            console.print("[red]用法: blacklist [list|add <en>|del <en>][/red]")
+            console.print("[red]用法: blacklist [list|add <pattern>|del <pattern>][/red]")
 
     def do_export(self, arg):
-        file = arg.strip() or "terms.json"
-        terms = load_terms()
-        data = {"terms": [t.model_dump() for t in terms]}
-        with open(file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        console.print(f"[green]已导出 {len(terms)} 条到 {file}[/green]")
+        export(arg.strip() or "terms.json")
 
     def do_import(self, arg):
-        file = arg.strip() or "terms.json"
-        if not os.path.exists(file):
-            console.print(f"[red]文件不存在: {file}[/red]")
-            return
-        with open(file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        raw_list = data.get("terms", data) if isinstance(data, dict) else data
-        from main import do_import
-        from schemas import ImportTerm
-        imports = []
-        for r in raw_list:
-            if isinstance(r, dict) and "en" in r and "zh" in r:
-                scope = r.get("scope")
-                if scope is None and "version" in r:
-                    ver = r["version"]
-                    from database import term_version_to_scope
-                    vs = ver[0] if ver else ""
-                    ve = ver[1] if len(ver) > 1 else vs
-                    scope = term_version_to_scope(vs, ve)
-                en_list = r["en"] if isinstance(r["en"], list) else [r["en"]]
-                zh_list = r["zh"] if isinstance(r["zh"], list) else [r["zh"]]
-                imports.append(ImportTerm(en=en_list, zh=zh_list, scope=scope))
-        terms = do_import(imports)
-        console.print(f"[green]已导入/合并 {len(imports)} 条, 共 {len(terms)} 条[/green]")
+        import_terms(arg.strip() or "terms.json")
 
     def do_stats(self, arg):
-        from database import get_connection
-        conn = get_connection()
-        total = conn.execute("SELECT COUNT(*) FROM vanilla_keys").fetchone()[0]
-        keys = conn.execute("SELECT COUNT(DISTINCT key) FROM vanilla_keys").fetchone()[0]
-        changed = conn.execute("SELECT COUNT(*) FROM vanilla_keys WHERE changes=1").fetchone()[0]
-        conn.close()
-        terms = load_terms()
-        bl = get_blacklist()
-        console.print(Panel.fit(
-            f"[bold]词条总数:[/bold] {total}\n"
-            f"[bold]唯一Key:[/bold] {keys}\n"
-            f"[bold]有变化的词条:[/bold] {changed}\n"
-            f"[bold]术语库:[/bold] {len(terms)} 条\n"
-            f"[bold]黑名单:[/bold] {len(bl)} 个",
-            title="[*] 统计信息",
-            border_style="cyan",
-        ))
+        stats()
+
+    def do_ghost(self, arg):
+        ghost_terms()
 
     def do_agent(self, arg):
         if not check_ai_available():
@@ -982,16 +968,10 @@ class AgentREPL(cmd.Cmd):
             border_style="green",
         ))
         if click.confirm("是否添加到术语库?", default=True):
-            existing = load_terms()
             term = Term(en=[result.get("en", arg)], zh=[result.get("zh", "")])
-            exists = any(
-                set(e.lower() for e in t.en) == set(e.lower() for e in term.en)
-                and set(t.zh) == set(term.zh)
-                for t in existing
-            )
-            if not exists:
-                existing.append(term)
-                save_terms(existing)
+            existing, is_new, is_merged, is_split = merge_term_into_library(term)
+            save_terms(existing)
+            if is_new or is_split or is_merged:
                 console.print("[green]已添加![/green]")
             else:
                 console.print("[yellow]已存在[/yellow]")
@@ -1049,20 +1029,14 @@ class AgentREPL(cmd.Cmd):
                 en_list = [r["en"]] if isinstance(r["en"], str) else r["en"]
                 zh_list = [r["zh"]] if isinstance(r["zh"], str) else r["zh"]
                 term = Term(en=en_list, zh=zh_list)
-                exists = any(
-                    set(e.lower() for e in t.en) == set(e.lower() for e in term.en)
-                    and set(t.zh) == set(term.zh)
-                    for t in existing
-                )
-                if not exists:
-                    existing.append(term)
+                existing, is_new, is_merged, is_split = merge_term_into_library(term, existing)
+                if is_new or is_split or is_merged:
                     added += 1
             save_terms(existing)
             console.print(f"[green]已添加 {added} 条[/green]")
 
     def _scan_inconsistencies(self):
         terms = load_terms()
-        blacklist = set(e.lower() for e in get_blacklist())
         phrase_map = build_phrase_map(terms)
         phrase_prefix = build_phrase_prefix(phrase_map)
         structured_patterns = build_structured_patterns(terms)
@@ -1075,7 +1049,7 @@ class AgentREPL(cmd.Cmd):
             en_text = e["en_us"] or ""
             zh_actual = e["zh_cn"] or ""
             generated, matched_terms, all_ok, match_found = generate_zh(
-                en_text, phrase_map, blacklist, phrase_prefix,
+                en_text, phrase_map, phrase_prefix,
                 structured_patterns=structured_patterns,
                 entry_key=e.get("key", ""), entry_en=en_text, entry_zh=zh_actual,
                 entry_ver_start=e.get("version_start", ""), entry_ver_end=e.get("version_end", ""),
