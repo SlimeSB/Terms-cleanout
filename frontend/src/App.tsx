@@ -421,6 +421,7 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
     setSelectedEntryRows(new Set())
     setShowEntryMerge(false)
     setMergeEnPattern(''); setMergeZhPattern(''); setMergePreview([])
+    setShowMergeScope(false); setMergeScopeVersion(''); setMergeScopeKey(''); setMergeScopeEn(''); setMergeScopeZh('')
     setTermLib(prev => {
       const exists = prev.some(t => t.en.some(e => e.toLowerCase() === term.en[0].toLowerCase()) && t.zh.some(z => z === term.zh[0]))
       return exists ? prev : [...prev, term]
@@ -751,9 +752,22 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
                 </tbody>
               </table>
             </div>
-            <div className="text-[10px] text-gray-600 mb-3">
-              将生成结构化术语：<code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeEnPattern}</code> → <code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeZhPattern}</code>
+            <div className="flex items-center gap-2 mb-2">
+              <button onClick={() => setShowMergeScope(v => !v)} className={`px-2 py-0.5 rounded text-[10px] border ${showMergeScope ? 'bg-blue-800 border-blue-600 text-blue-200' : 'bg-gray-800 border-gray-700 text-gray-400'}`}>
+                {showMergeScope ? '收起作用域' : '+ 作用域'}
+              </button>
+              <span className="text-[10px] text-gray-600">
+                将生成：<code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeEnPattern}</code> → <code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeZhPattern}</code>
+              </span>
             </div>
+            {showMergeScope && (
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="version 正则" value={mergeScopeVersion} onChange={e => setMergeScopeVersion(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="key 正则" value={mergeScopeKey} onChange={e => setMergeScopeKey(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="en 正则" value={mergeScopeEn} onChange={e => setMergeScopeEn(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="zh 正则" value={mergeScopeZh} onChange={e => setMergeScopeZh(e.target.value)} />
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <button onClick={() => setShowEntryMerge(false)} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">取消</button>
               <button onClick={confirmEntryMerge} className="px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-sm">确定</button>
