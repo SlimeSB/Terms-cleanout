@@ -41,6 +41,7 @@ app.add_middleware(
 
 BLACKLIST_FILE = os.path.join(os.path.dirname(__file__), "blacklist.json")
 NON_TERMS_FILE = os.path.join(os.path.dirname(__file__), "non_terms.json")
+STOPWORDS_FILE = os.path.join(os.path.dirname(__file__), "stopwords.json")
 
 
 def _rows_to_terms(rows: list[dict]) -> list[Term]:
@@ -88,6 +89,7 @@ def save_terms(terms: list[Term]):
 
 _blacklist_cache: list[str] | None = None
 _blacklist_re_cache: list[re.Pattern] | None = None
+_stopwords_cache: set[str] | None = None
 
 # Characters that unambiguously indicate a regex pattern (not just a literal key name)
 _RE_META = re.compile(r'[\\()[\]{}^*+?$|]')
@@ -120,6 +122,26 @@ def load_blacklist() -> list[str]:
     return _blacklist_cache
 
 
+def load_stopwords() -> set[str]:
+    global _stopwords_cache
+    if _stopwords_cache is not None:
+        return _stopwords_cache
+    if not os.path.exists(STOPWORDS_FILE):
+        _stopwords_cache = set()
+        return _stopwords_cache
+    with open(STOPWORDS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    _stopwords_cache = set(data) if isinstance(data, list) else set()
+    return _stopwords_cache
+
+
+def save_stopwords(items: list[str]):
+    global _stopwords_cache
+    with open(STOPWORDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(items), f, ensure_ascii=False, indent=2)
+    _stopwords_cache = None
+
+
 def save_blacklist(items: list[str]):
     global _blacklist_cache, _blacklist_re_cache
     with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
@@ -134,10 +156,10 @@ def _get_blacklist_exclude_keys() -> list[str]:
 
 
 def is_blacklisted_key(entry_key: str) -> bool:
-    """True if key matches a regex-type blacklist pattern (non-literal patterns only)."""
+    """True if key matches any blacklist pattern (all patterns use re.search)."""
     load_blacklist()
     for pattern in _blacklist_re_cache or []:
-        if _has_regex_meta(pattern.pattern) and pattern.search(entry_key):
+        if pattern.search(entry_key):
             return True
     return False
 
@@ -178,6 +200,7 @@ def build_structured_patterns(terms: list[Term]) -> list[tuple]:
             regex_str = "".join(regex_parts)
             regex = re.compile(f"^{regex_str}$", re.IGNORECASE)
             patterns.append((regex, t, variant))
+    patterns.sort(key=lambda p: -len(re.sub(r"\{\d+\}", "", p[2])))
     return patterns
 
 
@@ -437,12 +460,17 @@ def scope_equal(s1: dict | None, s2: dict | None) -> bool:
     return s1 == s2
 
 
+def labels_equal(l1: list[str] | None, l2: list[str] | None) -> bool:
+    """Check if two label lists are effectively equal."""
+    return (l1 or []) == (l2 or [])
+
+
 def merge_term_into_library(term: Term, existing: list[Term] | None = None) -> tuple[list[Term], bool, bool, bool]:
     """Merge a single Term into the term library.
     Returns (updated_library, is_new, is_merged, is_split).
     - is_new: term was appended fresh (no overlap with any existing)
     - is_merged: term's values were merged into an existing entry
-    - is_split: term was added as separate entry due to scope/var mismatch
+    - is_split: term was added as separate entry due to scope/var/label mismatch
     - all False: term already exists (skipped)
     """
     init_terms_table()
@@ -454,7 +482,8 @@ def merge_term_into_library(term: Term, existing: list[Term] | None = None) -> t
 
     for t in existing:
         if (set(e.lower() for e in t.en) == in_en_set and set(t.zh) == in_zh_set
-                and t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope)):
+                and t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope)
+                and labels_equal(t.labels, term.labels)):
             return existing, False, False, False
 
     for t in existing:
@@ -466,7 +495,7 @@ def merge_term_into_library(term: Term, existing: list[Term] | None = None) -> t
         new_zhs = [z for z in term.zh if z not in existing_zh_set]
         if not new_ens and not new_zhs:
             return existing, False, False, False
-        if t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope):
+        if t.variable_pos == term.variable_pos and scope_equal(t.scope, term.scope) and labels_equal(t.labels, term.labels):
             if new_ens:
                 t.en.extend(new_ens)
             if new_zhs:
@@ -536,11 +565,12 @@ def api_entries(
             filtered = all_raw[:]
 
         if sort == "freq":
+            stopwords = load_stopwords()
             freq: dict[str, int] = {}
             for e in all_raw:
                 for w in (e["en_us"] or "").lower().split():
                     wc = w.strip(",.!?;:\"'()[]{}")
-                    if wc:
+                    if wc and wc not in stopwords:
                         freq[wc] = freq.get(wc, 0) + 1
             filtered.sort(key=lambda e: (
                 -max(freq.get(w.strip(",.!?;:\"'()[]{}"), 0) for w in (e["en_us"] or "").lower().split() or ["_"]),
@@ -595,10 +625,10 @@ def _get_non_term_exclude_keys() -> list[str]:
 
 
 def is_non_term_key(entry_key: str) -> bool:
-    """True if key matches a regex-type non-term pattern (non-literal patterns only)."""
+    """True if key matches any non-term pattern (all patterns use re.search)."""
     load_non_terms()
     for pattern in _non_terms_re_cache or []:
-        if _has_regex_meta(pattern.pattern) and pattern.search(entry_key):
+        if pattern.search(entry_key):
             return True
     return False
 
@@ -890,7 +920,7 @@ def api_scan_entries(term: Term):
         en_text = entry["en_us"] or ""
         zh_actual = entry["zh_cn"] or ""
         generated, matched_terms, all_ok, match_found = generate_zh(
-            en_text, phrase_map, blacklist, phrase_prefix, zh_actual=zh_actual,
+            en_text, phrase_map, phrase_prefix, zh_actual=zh_actual,
             structured_patterns=structured_patterns,
             entry_key=entry.get("key", ""), entry_en=en_text,
             entry_zh=zh_actual,

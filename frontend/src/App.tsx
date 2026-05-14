@@ -127,17 +127,12 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
   const [nonTermInput, setNonTermInput] = useState('')
   const [highlightedRows, setHighlightedRows] = useState<number[]>([])
   const [showSearchHints, setShowSearchHints] = useState(false)
+  const [showAdjacentCompare, setShowAdjacentCompare] = useState(false)
+  const [adjacentItems, setAdjacentItems] = useState<{ entry: Entry; checked: boolean; en: string; zh: string }[]>([])
   const [selectedEntryRows, setSelectedEntryRows] = useState<Set<number>>(new Set())
-  const [showEntryMerge, setShowEntryMerge] = useState(false)
-  const [mergeEnPattern, setMergeEnPattern] = useState('')
-  const [mergeZhPattern, setMergeZhPattern] = useState('')
-  const [mergePreview, setMergePreview] = useState<{ en: string; zh: string }[]>([])
-  const [showMergeScope, setShowMergeScope] = useState(false)
-  const [mergeScopeVersion, setMergeScopeVersion] = useState('')
-  const [mergeScopeKey, setMergeScopeKey] = useState('')
-  const [mergeScopeEn, setMergeScopeEn] = useState('')
-  const [mergeScopeZh, setMergeScopeZh] = useState('')
+  const [batchProcessing, setBatchProcessing] = useState(false)
   const searchRef = useRef<HTMLDivElement>(null)
+  const lastClickedRowRef = useRef<number>(-1)
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -284,6 +279,7 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
     setModalEntry(entry)
     setModalVariablePos(false)
     setShowScopeInput(false)
+    setShowAdjacentCompare(false)
     const autoScope = makeScopeFromEntry(entry)
     setModalScopeVersion(autoScope?.version || '')
     setModalScopeKey('')
@@ -348,14 +344,18 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
     if (modalScopeKey) scope.key = modalScopeKey
     if (modalScopeEn) scope.en = modalScopeEn
     if (modalScopeZh) scope.zh = modalScopeZh
+    const modalEnParts = modalEn.split('|').map(s => s.trim()).filter(Boolean)
+    const modalZhParts = modalZh.split('|').map(s => s.trim()).filter(Boolean)
+    if (modalEnParts.length === 0 || modalZhParts.length === 0) return
     const term: Term = {
-      en: [modalEn.trim()],
-      zh: [modalZh.trim()],
+      en: modalEnParts,
+      zh: modalZhParts,
       scope: Object.keys(scope).length > 0 ? scope : (Object.keys(baseScope).length > 0 ? baseScope : undefined),
       variable_pos: modalVariablePos,
     }
     const entry = modalEntry
     setModalEntry(null)
+    setShowAdjacentCompare(false)
     setScanning(true)
     try {
       await addTerm(term)
@@ -392,43 +392,93 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
     return { prefix: '', suffix }
   }
 
-  const openEntryMerge = () => {
-    const entries = data?.entries || []
-    const selected = entries.filter(e => selectedEntryRows.has(e.rowid))
-    if (selected.length < 2) return
-    const enStrs = selected.map(e => e.en_us || '')
-    const zhStrs = selected.map(e => e.zh_cn || '')
-    const enResult = findCommonEn(enStrs)
-    const zhResult = findCommonEn(zhStrs)
-    setMergeEnPattern(enResult ? `${enResult.prefix}{0}${enResult.suffix}` : enStrs[0])
-    setMergeZhPattern(zhResult ? `${zhResult.prefix}{0}${zhResult.suffix}` : zhStrs[0])
-    setMergePreview(selected.map(e => ({ en: e.en_us || '', zh: e.zh_cn || '' })))
-    setShowEntryMerge(true)
+  const openAdjacentCompare = async () => {
+    if (!modalEntry) return
+    const res = await getEntries({ page_size: 200, hide_matched: 'false' })
+    const allEntries = res.data.entries
+    const idx = allEntries.findIndex(e => e.rowid === modalEntry.rowid)
+    if (idx === -1) return
+    const items: { entry: Entry; checked: boolean; en: string; zh: string }[] = []
+    if (idx > 0) {
+      const prev = allEntries[idx - 1]
+      items.push({ entry: prev, checked: true, en: prev.en_us || '', zh: prev.zh_cn || '' })
+    }
+    items.push({ entry: modalEntry, checked: true, en: modalEn, zh: modalZh })
+    if (idx < allEntries.length - 1) {
+      const next = allEntries[idx + 1]
+      items.push({ entry: next, checked: true, en: next.en_us || '', zh: next.zh_cn || '' })
+    }
+    setAdjacentItems(items)
+    recalcAdjacentPattern(items)
+    setShowAdjacentCompare(true)
   }
 
-  const confirmEntryMerge = async () => {
-    if (!mergeEnPattern.trim() || !mergeZhPattern.trim()) return
-    const scope: Record<string, string> = {}
-    if (mergeScopeVersion) scope.version = mergeScopeVersion
-    if (mergeScopeKey) scope.key = mergeScopeKey
-    if (mergeScopeEn) scope.en = mergeScopeEn
-    if (mergeScopeZh) scope.zh = mergeScopeZh
-    const term: Term = { en: [mergeEnPattern.trim()], zh: [mergeZhPattern.trim()], scope: Object.keys(scope).length > 0 ? scope : undefined }
-    await addTerm(term)
-    const res = await scanEntries(term)
-    setScanResult({ term, results: res.data.results })
-    onIssuesAdd(term.en.join('|'), res.data.results)
+  const recalcAdjacentPattern = (items: typeof adjacentItems) => {
+    const checked = items.filter(i => i.checked)
+    if (checked.length < 1) return
+    const enStrs = checked.map(i => i.en)
+    const zhStrs = checked.map(i => i.zh)
+    if (checked.length === 1) {
+      setModalEn(enStrs[0]); setModalZh(zhStrs[0])
+    } else {
+      const enResult = findCommonEn(enStrs)
+      const zhResult = findCommonEn(zhStrs)
+      setModalEn(enResult ? `${enResult.prefix}{0}${enResult.suffix}` : enStrs[0])
+      setModalZh(zhResult ? `${zhResult.prefix}{0}${zhResult.suffix}` : zhStrs[0])
+    }
+  }
+
+  const batchRawAdd = async () => {
+    if (!data?.entries) return
+    const selected = data.entries.filter(e => selectedEntryRows.has(e.rowid))
+    if (selected.length === 0) return
+    setBatchProcessing(true)
+    let ok = 0, fail = 0
+    for (const entry of selected) {
+      const en = (entry.en_us || '').trim()
+      const zh = (entry.zh_cn || '').trim()
+      if (!en || !zh) { fail++; continue }
+      try {
+        await addTerm({ en: [en], zh: [zh], scope: makeScopeFromEntry(entry) })
+        setTermLib(prev => prev.some(t => t.en.some(e => e.toLowerCase() === en.toLowerCase()) && t.zh.some(z => z === zh)) ? prev : [...prev, { en: [en], zh: [zh] }])
+        ok++
+      } catch { fail++ }
+    }
     setSelectedEntryRows(new Set())
-    setShowEntryMerge(false)
-    setMergeEnPattern(''); setMergeZhPattern(''); setMergePreview([])
-    setShowMergeScope(false); setMergeScopeVersion(''); setMergeScopeKey(''); setMergeScopeEn(''); setMergeScopeZh('')
-    setTermLib(prev => {
-      const exists = prev.some(t => t.en.some(e => e.toLowerCase() === term.en[0].toLowerCase()) && t.zh.some(z => z === term.zh[0]))
-      return exists ? prev : [...prev, term]
-    })
-    setHighlightedRows(prev => [...prev, ...(data?.entries || []).filter(e =>
-      (e.en_us || '').toLowerCase().includes(mergeEnPattern.toLowerCase().replace('{0}', ''))
-    ).map(e => e.rowid)])
+    setBatchProcessing(false)
+    setHighlightedRows(prev => [...prev, ...selected.map(e => e.rowid)])
+    if (ok > 0) load()
+  }
+
+  const batchBlacklist = async () => {
+    if (!data?.entries) return
+    const selected = data.entries.filter(e => selectedEntryRows.has(e.rowid))
+    if (selected.length === 0) return
+    setBatchProcessing(true)
+    for (const entry of selected) {
+      if (!blacklist.includes(entry.key)) {
+        try { await addToBlacklist(entry.key) } catch {}
+      }
+    }
+    refreshBlacklist()
+    setSelectedEntryRows(new Set())
+    setBatchProcessing(false)
+  }
+
+  const batchNonTerm = async () => {
+    if (!data?.entries) return
+    const selected = data.entries.filter(e => selectedEntryRows.has(e.rowid))
+    if (selected.length === 0) return
+    setBatchProcessing(true)
+    for (const entry of selected) {
+      const matched = nonTerms.find(p => new RegExp(p).test(entry.key))
+      if (!matched) {
+        try { await addNonTerm(entry.key) } catch {}
+      }
+    }
+    refreshNonTerms()
+    setSelectedEntryRows(new Set())
+    setBatchProcessing(false)
   }
 
   const totalPages = data ? Math.ceil(data.total / data.page_size) : 0
@@ -493,41 +543,15 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
             title="刷新"
           >刷新</button>
           <span className="text-sm text-gray-500 self-center">{data?.total ?? '...'} 条</span>
-          <div title="非术语 key 模式（正则），匹配的条目跳过术语检查，适合翻译记忆" className="flex gap-0.5">
-            <input
-              placeholder="+非术语模式"
-              className="w-24 bg-gray-900 border border-gray-700 rounded px-1.5 py-1 text-[10px] outline-none focus:border-purple-500"
-              value={nonTermInput}
-              onChange={e => setNonTermInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && nonTermInput.trim()) { addNonTerm(nonTermInput.trim()); setNonTermInput(''); refreshNonTerms() } }}
-            />
-          </div>
         </div>
 
-        {/* Non-terms (collapsible) */}
-        {nonTerms.length > 0 && (
-          <details className="text-xs text-gray-500 bg-gray-900/50 rounded border border-gray-800 px-3 py-2">
-            <summary className="cursor-pointer hover:text-gray-300">
-              非术语列表 <span className="text-gray-600">({nonTerms.length} 条)</span>
-              <span className="ml-2 text-[10px] text-gray-600">— 标记为"非术语"的 key 完全跳过术语检查，适合翻译记忆类条目</span>
-            </summary>
-            <div className="flex flex-wrap gap-1.5 mt-2">
-              {nonTerms.map(p => (
-                <span key={p} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-300 text-[10px]">
-                  {p}
-                  <button onClick={() => { removeNonTerm(p); refreshNonTerms() }} className="text-[10px] px-0.5 rounded bg-purple-800 hover:bg-purple-700">x</button>
-                </span>
-              ))}
-            </div>
-          </details>
-        )}
-
-        {/* Entry selection toolbar */}
         {selectedEntryRows.size > 0 && (
           <div className="flex items-center gap-2 px-2 py-1.5 bg-blue-900/30 border border-blue-800/50 rounded text-sm">
             <span className="text-blue-200">已选 <strong>{selectedEntryRows.size}</strong> 条词条</span>
             <button onClick={() => setSelectedEntryRows(new Set())} className="text-xs px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">取消选择</button>
-            <button onClick={openEntryMerge} disabled={selectedEntryRows.size < 2} className="text-xs px-2 py-0.5 rounded bg-green-800 hover:bg-green-700 disabled:opacity-50">提取共同结构</button>
+            <button onClick={batchRawAdd} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-green-800 hover:bg-green-700 disabled:opacity-50">批量原样</button>
+            <button onClick={batchBlacklist} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-yellow-800 hover:bg-yellow-700 disabled:opacity-50">批量屏蔽</button>
+            <button onClick={batchNonTerm} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-purple-800 hover:bg-purple-700 disabled:opacity-50">批量非术语</button>
           </div>
         )}
 
@@ -563,11 +587,33 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
                 >
                   <td className="p-2 w-8" onClick={e => e.stopPropagation()}>
                     <input type="checkbox" className="accent-blue-500" checked={selectedEntryRows.has(e.rowid)}
-                      onChange={() => setSelectedEntryRows(prev => {
-                        const next = new Set(prev)
-                        if (next.has(e.rowid)) next.delete(e.rowid); else next.add(e.rowid)
-                        return next
-                      })} />
+                      onChange={(ev) => {
+                        const checked = ev.target.checked
+                        const isShift = (ev.nativeEvent as MouseEvent).shiftKey
+                        if (isShift && lastClickedRowRef.current !== -1) {
+                          const entries = data?.entries || []
+                          const currentIdx = entries.findIndex(en => en.rowid === e.rowid)
+                          const lastIdx = entries.findIndex(en => en.rowid === lastClickedRowRef.current)
+                          if (currentIdx !== -1 && lastIdx !== -1) {
+                            const [start, end] = currentIdx > lastIdx ? [lastIdx, currentIdx] : [currentIdx, lastIdx]
+                            setSelectedEntryRows(prev => {
+                              const next = new Set(prev)
+                              for (let i = start; i <= end; i++) {
+                                if (checked) next.add(entries[i].rowid)
+                                else next.delete(entries[i].rowid)
+                              }
+                              return next
+                            })
+                          }
+                        } else {
+                          setSelectedEntryRows(prev => {
+                            const next = new Set(prev)
+                            if (next.has(e.rowid)) next.delete(e.rowid); else next.add(e.rowid)
+                            return next
+                          })
+                        }
+                        lastClickedRowRef.current = e.rowid
+                      }} />
                   </td>
                   <td className="p-2 font-mono text-xs text-gray-400 max-w-[200px] truncate">{e.key}</td>
                   <td className="p-2">{e.en_us}</td>
@@ -600,6 +646,16 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
             </tbody>
           </table>
         </div>
+
+        {selectedEntryRows.size > 0 && (
+          <div className="flex items-center gap-2 px-2 py-1.5 bg-blue-900/30 border border-blue-800/50 rounded text-sm">
+            <span className="text-blue-200">已选 <strong>{selectedEntryRows.size}</strong> 条词条</span>
+            <button onClick={() => setSelectedEntryRows(new Set())} className="text-xs px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">取消选择</button>
+            <button onClick={batchRawAdd} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-green-800 hover:bg-green-700 disabled:opacity-50">批量原样</button>
+            <button onClick={batchBlacklist} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-yellow-800 hover:bg-yellow-700 disabled:opacity-50">批量屏蔽</button>
+            <button onClick={batchNonTerm} disabled={batchProcessing} className="text-xs px-2 py-0.5 rounded bg-purple-800 hover:bg-purple-700 disabled:opacity-50">批量非术语</button>
+          </div>
+        )}
 
         {totalPages > 1 && (
           <div className="flex gap-1 justify-center">
@@ -664,7 +720,7 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
               onKeyDown={e => e.key === 'Enter' && confirmQuickTerm()}
             />
             <div className="flex justify-between items-center mb-2">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <button onClick={fillOriginal} className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-300">填充原文</button>
                 <label className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none">
                   <input type="checkbox" checked={modalVariablePos} onChange={e => setModalVariablePos(e.target.checked)} className="accent-blue-500" />
@@ -673,108 +729,96 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
                 <button onClick={() => setShowScopeInput(v => !v)} className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-300">
                   {showScopeInput ? '收起作用域' : '+ 作用域'}
                 </button>
+                {!showAdjacentCompare && (
+                  <button onClick={openAdjacentCompare} className="text-xs px-2 py-1 rounded bg-indigo-800 hover:bg-indigo-700 text-gray-200">
+                    邻近共同结构
+                  </button>
+                )}
               </div>
               <span className="text-[10px] text-gray-500">Enter 键提交</span>
             </div>
             {showScopeInput && (
               <div className="grid grid-cols-2 gap-2 mb-3">
-                <input
-                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-                  placeholder="version 正则"
-                  value={modalScopeVersion}
-                  onChange={e => setModalScopeVersion(e.target.value)}
-                />
-                <input
-                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-                  placeholder="key 正则"
-                  value={modalScopeKey}
-                  onChange={e => setModalScopeKey(e.target.value)}
-                />
-                <input
-                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-                  placeholder="en 正则"
-                  value={modalScopeEn}
-                  onChange={e => setModalScopeEn(e.target.value)}
-                />
-                <input
-                  className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-                  placeholder="zh 正则"
-                  value={modalScopeZh}
-                  onChange={e => setModalScopeZh(e.target.value)}
-                />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="version 正则" value={modalScopeVersion} onChange={e => setModalScopeVersion(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="key 正则" value={modalScopeKey} onChange={e => setModalScopeKey(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="en 正则" value={modalScopeEn} onChange={e => setModalScopeEn(e.target.value)} />
+                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="zh 正则" value={modalScopeZh} onChange={e => setModalScopeZh(e.target.value)} />
               </div>
             )}
+
+            {showAdjacentCompare && (
+              <div className="mb-3">
+                <div className="text-[10px] text-gray-400 mb-1 font-semibold">对比条目（取消勾选以去除比对）</div>
+                <div className="border border-gray-700 rounded overflow-auto max-h-32">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-900 sticky top-0">
+                      <tr className="text-gray-400">
+                        <th className="p-1 w-6"></th>
+                        <th className="p-1 text-left">Key</th>
+                        <th className="p-1 text-left">EN</th>
+                        <th className="p-1 text-left">ZH</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {adjacentItems.map((item, i) => (
+                        <tr key={item.entry.rowid} className="border-t border-gray-800">
+                          <td className="p-1">
+                            <input type="checkbox" checked={item.checked} className="accent-blue-500"
+                              onChange={() => {
+                                setAdjacentItems(prev => {
+                                  const next = [...prev]
+                                  next[i] = { ...next[i], checked: !next[i].checked }
+                                  recalcAdjacentPattern(next)
+                                  return next
+                                })
+                              }} />
+                          </td>
+                          <td className="p-1 text-gray-400 truncate max-w-[80px]" title={item.entry.key}>{item.entry.key}</td>
+                          <td className="p-1">
+                            <input className="w-full bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-[10px] outline-none focus:border-blue-500"
+                              value={item.en} onChange={e => {
+                                setAdjacentItems(prev => {
+                                  const next = [...prev]
+                                  next[i] = { ...next[i], en: e.target.value }
+                                  recalcAdjacentPattern(next)
+                                  return next
+                                })
+                              }} />
+                          </td>
+                          <td className="p-1">
+                            <input className="w-full bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-[10px] outline-none focus:border-blue-500"
+                              value={item.zh} onChange={e => {
+                                setAdjacentItems(prev => {
+                                  const next = [...prev]
+                                  next[i] = { ...next[i], zh: e.target.value }
+                                  recalcAdjacentPattern(next)
+                                  return next
+                                })
+                              }} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="text-[10px] text-gray-500 mt-1">
+                  将生成：<code className="text-blue-400 bg-gray-800 px-0.5 rounded">{modalEn}</code> → <code className="text-blue-400 bg-gray-800 px-0.5 rounded">{modalZh}</code>
+                </div>
+              </div>
+            )}
+
             <div className="text-[10px] text-gray-600">
               结构化术语示例：<code className="text-blue-400 bg-gray-800 px-0.5 rounded">{'{0} Base'}</code> → <code className="text-blue-400 bg-gray-800 px-0.5 rounded">底{'{0}'}横条</code>
             </div>
             <div className="flex justify-end gap-2">
-              <button onClick={() => setModalEntry(null)} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">取消</button>
+              <button onClick={() => { setModalEntry(null); setShowAdjacentCompare(false) }} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">取消</button>
               <button onClick={confirmQuickTerm} className="px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-sm">确定</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Entry merge dialog */}
-      {showEntryMerge && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-5 w-[480px] shadow-xl" onClick={e => e.stopPropagation()}>
-            <h3 className="text-sm font-bold mb-3">提取共同结构</h3>
-            <div className="mb-3">
-              <label className="text-xs text-gray-400 mb-1 block">英文模式（{'{0}'} 为差异部分）</label>
-              <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-sm outline-none focus:border-blue-500 font-mono"
-                value={mergeEnPattern}
-                onChange={e => setMergeEnPattern(e.target.value)}
-              />
-            </div>
-            <div className="mb-3">
-              <label className="text-xs text-gray-400 mb-1 block">中文模式（{'{0}'} 为差异部分）</label>
-              <input className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-sm outline-none focus:border-blue-500 font-mono"
-                value={mergeZhPattern}
-                onChange={e => setMergeZhPattern(e.target.value)}
-              />
-            </div>
-            <div className="max-h-40 overflow-auto rounded border border-gray-700 mb-3">
-              <table className="w-full text-xs">
-                <thead className="bg-gray-900 sticky top-0">
-                  <tr className="text-gray-400">
-                    <th className="p-1.5 text-left">原 EN</th>
-                    <th className="p-1.5 text-left">原 ZH</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {mergePreview.map((p, i) => (
-                    <tr key={i} className="border-t border-gray-800 text-gray-300">
-                      <td className="p-1.5">{p.en}</td>
-                      <td className="p-1.5 text-blue-300">{p.zh}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex items-center gap-2 mb-2">
-              <button onClick={() => setShowMergeScope(v => !v)} className={`px-2 py-0.5 rounded text-[10px] border ${showMergeScope ? 'bg-blue-800 border-blue-600 text-blue-200' : 'bg-gray-800 border-gray-700 text-gray-400'}`}>
-                {showMergeScope ? '收起作用域' : '+ 作用域'}
-              </button>
-              <span className="text-[10px] text-gray-600">
-                将生成：<code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeEnPattern}</code> → <code className="text-blue-400 bg-gray-800 px-0.5 rounded">{mergeZhPattern}</code>
-              </span>
-            </div>
-            {showMergeScope && (
-              <div className="grid grid-cols-2 gap-2 mb-3">
-                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="version 正则" value={mergeScopeVersion} onChange={e => setMergeScopeVersion(e.target.value)} />
-                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="key 正则" value={mergeScopeKey} onChange={e => setMergeScopeKey(e.target.value)} />
-                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="en 正则" value={mergeScopeEn} onChange={e => setMergeScopeEn(e.target.value)} />
-                <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500" placeholder="zh 正则" value={mergeScopeZh} onChange={e => setMergeScopeZh(e.target.value)} />
-              </div>
-            )}
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setShowEntryMerge(false)} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">取消</button>
-              <button onClick={confirmEntryMerge} className="px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-sm">确定</button>
-            </div>
-          </div>
-        </div>
-      )}
+
     </div>
   )
 }
@@ -825,6 +869,7 @@ function TermsView() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [confirmReady, setConfirmReady] = useState(false)
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastClickedTermRef = useRef<number>(-1)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [showBatchRename, setShowBatchRename] = useState(false)
   const [batchOldPattern, setBatchOldPattern] = useState('')
@@ -844,6 +889,9 @@ function TermsView() {
   const [batchScopeEn, setBatchScopeEn] = useState('')
   const [batchScopeZh, setBatchScopeZh] = useState('')
   const [blacklist, setBlacklist] = useState<string[]>([])
+  const [blacklistInput, setBlacklistInput] = useState('')
+  const [nonTerms, setNonTerms] = useState<string[]>([])
+  const [nonTermInput, setNonTermInput] = useState('')
   const [labelInputEn, setLabelInputEn] = useState<string | null>(null)
   const [labelInputVal, setLabelInputVal] = useState('')
 
@@ -861,6 +909,11 @@ function TermsView() {
   const loadBlacklist = useCallback(async () => {
     const res = await getBlacklist()
     setBlacklist(res.data.blacklist)
+  }, [])
+
+  const loadNonTerms = useCallback(async () => {
+    const res = await getNonTerms()
+    setNonTerms(res.data.non_terms)
   }, [])
 
   function findCommonPattern(strs: string[]): string | null {
@@ -898,6 +951,7 @@ function TermsView() {
   useEffect(() => { load() }, [load])
   useEffect(() => { loadLabels() }, [loadLabels])
   useEffect(() => { loadBlacklist() }, [loadBlacklist])
+  useEffect(() => { loadNonTerms() }, [loadNonTerms])
 
   const handleSearch = () => {
     setSearch(searchInput)
@@ -908,7 +962,10 @@ function TermsView() {
     const scope: Record<string, string> | undefined = (showScopeInput && (scopeVersionInput || scopeKeyInput || scopeEnInput || scopeZhInput))
       ? { ...(scopeVersionInput && { version: scopeVersionInput }), ...(scopeKeyInput && { key: scopeKeyInput }), ...(scopeEnInput && { en: scopeEnInput }), ...(scopeZhInput && { zh: scopeZhInput }) }
       : undefined
-    const term: Term = { en: [enInput.trim()], zh: [zhInput.trim()], scope, variable_pos: addVariablePos }
+    const enParts = enInput.split('|').map(s => s.trim()).filter(Boolean)
+    const zhParts = zhInput.split('|').map(s => s.trim()).filter(Boolean)
+    if (enParts.length === 0 || zhParts.length === 0) return
+    const term: Term = { en: enParts, zh: zhParts, scope, variable_pos: addVariablePos }
     await addTerm(term)
     setEnInput('')
     setZhInput('')
@@ -1157,13 +1214,14 @@ function TermsView() {
         <div className="flex gap-2 mb-2">
           <input
             className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm outline-none focus:border-blue-500"
-            placeholder="英文 (en)，使用 {0} 作为占位符"
-            value={enInput}
+            placeholder="英文 (en，| 分隔多值)"
+
+           value={enInput}
             onChange={e => setEnInput(e.target.value)}
           />
           <input
             className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm outline-none focus:border-blue-500"
-            placeholder="中文 (zh)"
+            placeholder="中文 (zh，| 分隔多值)"
             value={zhInput}
             onChange={e => setZhInput(e.target.value)}
           />
@@ -1221,21 +1279,61 @@ function TermsView() {
       </div>
 
       {/* Blacklist */}
-      {blacklist.length > 0 && (
-        <details className="bg-gray-900 rounded border border-gray-800">
-          <summary className="px-3 py-2 text-xs font-bold text-gray-400 cursor-pointer hover:text-gray-300 select-none">
-            黑名单 <span className="text-gray-600">({blacklist.length} 个模式)</span>
-          </summary>
-          <div className="flex flex-wrap gap-1.5 px-3 pb-3">
-            {blacklist.map(p => (
-              <span key={p} className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-yellow-900/40 text-yellow-300 text-xs">
-                {p}
-                <button onClick={() => toggleBlacklist(p)} className="text-[10px] px-1 rounded bg-yellow-800 hover:bg-yellow-700">剔除</button>
-              </span>
-            ))}
+      <details className="bg-gray-900 rounded border border-gray-800">
+        <summary className="px-3 py-2 text-xs font-bold text-gray-400 cursor-pointer hover:text-gray-300 select-none">
+          黑名单 <span className="text-gray-600">({blacklist.length} 个正则模式)</span>
+        </summary>
+        <div className="px-3 pb-2">
+          <div className="flex gap-1 mb-2">
+            <input
+              placeholder="+黑名单正则"
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-[10px] outline-none focus:border-yellow-500"
+              value={blacklistInput}
+              onChange={e => setBlacklistInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && blacklistInput.trim()) { addToBlacklist(blacklistInput.trim()); setBlacklistInput(''); loadBlacklist() } }}
+            />
           </div>
-        </details>
-      )}
+          {blacklist.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {blacklist.map(p => (
+                <span key={p} className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-yellow-900/40 text-yellow-300 text-xs">
+                  {p}
+                  <button onClick={() => { removeFromBlacklist(p); loadBlacklist() }} className="text-[10px] px-1 rounded bg-yellow-800 hover:bg-yellow-700">x</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </details>
+
+      {/* Non-terms */}
+      <details className="bg-gray-900 rounded border border-gray-800">
+        <summary className="px-3 py-2 text-xs font-bold text-gray-400 cursor-pointer hover:text-gray-300 select-none">
+          非术语 <span className="text-gray-600">({nonTerms.length} 个正则模式)</span>
+          <span className="ml-2 text-[10px] text-gray-600 font-normal">— 匹配的 key 完全跳过术语检查</span>
+        </summary>
+        <div className="px-3 pb-2">
+          <div className="flex gap-1 mb-2">
+            <input
+              placeholder="+非术语正则"
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-[10px] outline-none focus:border-purple-500"
+              value={nonTermInput}
+              onChange={e => setNonTermInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && nonTermInput.trim()) { addNonTerm(nonTermInput.trim()); setNonTermInput(''); loadNonTerms() } }}
+            />
+          </div>
+          {nonTerms.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {nonTerms.map(p => (
+                <span key={p} className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-purple-900/40 text-purple-300 text-xs">
+                  {p}
+                  <button onClick={() => { removeNonTerm(p); loadNonTerms() }} className="text-[10px] px-1 rounded bg-purple-800 hover:bg-purple-700">x</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </details>
 
       {/* Selection toolbar */}
       {selectedKeys.size > 0 && (
@@ -1301,7 +1399,28 @@ function TermsView() {
               <tr key={`${t.en.join('|')}-${t.zh.join('|')}`} className={`border-t border-gray-800 hover:bg-gray-900 ${selectedKeys.has(t.en[0]) ? 'bg-blue-900/20' : ''}`}>
                 {editingKey === t.en[0] ? (
                   <>
-                    <td className="p-2 w-8"><input type="checkbox" checked={selectedKeys.has(t.en[0])} onChange={() => toggleSelect(t.en[0])} className="accent-blue-500" onClick={e => e.stopPropagation()} /></td>
+                    <td className="p-2 w-8"><input type="checkbox" checked={selectedKeys.has(t.en[0])} className="accent-blue-500" onClick={e => e.stopPropagation()} onChange={(ev) => {
+                      const checked = ev.target.checked
+                      const isShift = (ev.nativeEvent as MouseEvent).shiftKey
+                      if (isShift && lastClickedTermRef.current !== -1) {
+                        const currentIdx = terms.findIndex(tt => tt.en[0] === t.en[0])
+                        const lastIdx = lastClickedTermRef.current
+                        if (currentIdx !== -1 && lastIdx !== -1) {
+                          const [start, end] = currentIdx > lastIdx ? [lastIdx, currentIdx] : [currentIdx, lastIdx]
+                          setSelectedKeys(prev => {
+                            const next = new Set(prev)
+                            for (let i = start; i <= end; i++) {
+                              if (checked) next.add(terms[i].en[0])
+                              else next.delete(terms[i].en[0])
+                            }
+                            return next
+                          })
+                        }
+                      } else {
+                        toggleSelect(t.en[0])
+                      }
+                      lastClickedTermRef.current = terms.findIndex(tt => tt.en[0] === t.en[0])
+                    }} /></td>
                     <td className="p-2"><input className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-full" value={editingEn} onChange={e => setEditingEn(e.target.value)} /></td>
                     <td className="p-2"><input className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-full" value={editingZh} onChange={e => setEditingZh(e.target.value)} /></td>
                     <td className="p-2 text-xs">
@@ -1324,7 +1443,28 @@ function TermsView() {
                   </>
                 ) : (
                   <>
-                    <td className="p-2 w-8"><input type="checkbox" checked={selectedKeys.has(t.en[0])} onChange={() => toggleSelect(t.en[0])} className="accent-blue-500" onClick={e => e.stopPropagation()} /></td>
+                    <td className="p-2 w-8"><input type="checkbox" checked={selectedKeys.has(t.en[0])} className="accent-blue-500" onClick={e => e.stopPropagation()} onChange={(ev) => {
+                      const checked = ev.target.checked
+                      const isShift = (ev.nativeEvent as MouseEvent).shiftKey
+                      if (isShift && lastClickedTermRef.current !== -1) {
+                        const currentIdx = terms.findIndex(tt => tt.en[0] === t.en[0])
+                        const lastIdx = lastClickedTermRef.current
+                        if (currentIdx !== -1 && lastIdx !== -1) {
+                          const [start, end] = currentIdx > lastIdx ? [lastIdx, currentIdx] : [currentIdx, lastIdx]
+                          setSelectedKeys(prev => {
+                            const next = new Set(prev)
+                            for (let i = start; i <= end; i++) {
+                              if (checked) next.add(terms[i].en[0])
+                              else next.delete(terms[i].en[0])
+                            }
+                            return next
+                          })
+                        }
+                      } else {
+                        toggleSelect(t.en[0])
+                      }
+                      lastClickedTermRef.current = terms.findIndex(tt => tt.en[0] === t.en[0])
+                    }} /></td>
                     <td className="p-2 font-medium">
                       {t.en.join('|')}
                       {/\{\d+\}/.test(t.en.join('|')) && <span className="ml-2 text-[10px] px-1 py-0.5 rounded bg-blue-900 text-blue-300">结构</span>}
