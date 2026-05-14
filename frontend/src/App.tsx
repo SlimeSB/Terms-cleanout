@@ -1177,7 +1177,7 @@ function TermsView() {
     if (newEn.length === 0 || newZh.length === 0) return
     const scope: Record<string, string> | undefined = (editingScopeVersion || editingScopeKey || editingScopeEn || editingScopeZh)
       ? { ...(editingScopeVersion && { version: editingScopeVersion }), ...(editingScopeKey && { key: editingScopeKey }), ...(editingScopeEn && { en: editingScopeEn }), ...(editingScopeZh && { zh: editingScopeZh }) }
-      : undefined
+      : {}
     await deleteTerm(editingKey)
     const term: Term = { en: newEn, zh: newZh, scope, variable_pos: editingVariablePos }
     await addTerm(term)
@@ -1627,6 +1627,9 @@ function IssuesView({
   const [fixEn, setFixEn] = useState('')
   const [fixZh, setFixZh] = useState('')
   const [fixScopeVersion, setFixScopeVersion] = useState('')
+  const [fixScopeKey, setFixScopeKey] = useState('')
+  const [fixScopeEn, setFixScopeEn] = useState('')
+  const [fixScopeZh, setFixScopeZh] = useState('')
   const [fixMsg, setFixMsg] = useState('')
   const [fixScanResult, setFixScanResult] = useState<ScanResult[] | null>(null)
   const [fixTermIndex, setFixTermIndex] = useState(0)
@@ -1789,13 +1792,33 @@ function IssuesView({
               value={fixZh}
               onChange={e => setFixZh(e.target.value)}
             />
-            <label className="block text-xs text-gray-400 mb-1">作用域版本（留空=全版本）</label>
-            <input
-              className="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm outline-none focus:border-blue-500 mb-4"
-              placeholder="例: 1.19.2"
-              value={fixScopeVersion}
-              onChange={e => setFixScopeVersion(e.target.value)}
-            />
+            <label className="block text-xs text-gray-400 mb-1">作用域（留空=全版本）</label>
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              <input
+                className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                placeholder="version 正则"
+                value={fixScopeVersion}
+                onChange={e => setFixScopeVersion(e.target.value)}
+              />
+              <input
+                className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                placeholder="key 正则"
+                value={fixScopeKey}
+                onChange={e => setFixScopeKey(e.target.value)}
+              />
+              <input
+                className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                placeholder="en 正则"
+                value={fixScopeEn}
+                onChange={e => setFixScopeEn(e.target.value)}
+              />
+              <input
+                className="bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                placeholder="zh 正则"
+                value={fixScopeZh}
+                onChange={e => setFixScopeZh(e.target.value)}
+              />
+            </div>
 
             {fixMsg && (
               <div className={`text-xs mb-3 ${fixMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'}`}>{fixMsg}</div>
@@ -1817,7 +1840,7 @@ function IssuesView({
             )}
 
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setFixingIssue(null); setFixMsg(''); setFixScanResult(null) }} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">关闭</button>
+              <button onClick={() => { setFixingIssue(null); setFixMsg(''); setFixScanResult(null); setFixScopeKey(''); setFixScopeEn(''); setFixScopeZh('') }} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">关闭</button>
               <button onClick={saveFix} className="px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-sm">保存并扫描</button>
             </div>
           </div>
@@ -1831,6 +1854,9 @@ function IssuesView({
     setFixTermIndex(index)
     setFixMsg('')
     setFixScanResult(null)
+    setFixScopeKey('')
+    setFixScopeEn('')
+    setFixScopeZh('')
     if (issue.matched_terms.length > 0) {
       const termStr = issue.matched_terms[index] || issue.matched_terms[0]
       setFixEn(termStr)
@@ -1849,14 +1875,23 @@ function IssuesView({
       if (foundTerm) {
         setFixZh(foundTerm.zh.join('|'))
         setFixScopeVersion(foundTerm.scope?.version || '')
+        setFixScopeKey(foundTerm.scope?.key || '')
+        setFixScopeEn(foundTerm.scope?.en || '')
+        setFixScopeZh(foundTerm.scope?.zh || '')
       } else {
         setFixZh('')
         setFixScopeVersion('')
+        setFixScopeKey('')
+        setFixScopeEn('')
+        setFixScopeZh('')
       }
     } else {
       setFixEn('')
       setFixZh('')
       setFixScopeVersion('')
+      setFixScopeKey('')
+      setFixScopeEn('')
+      setFixScopeZh('')
     }
   }
 
@@ -1870,9 +1905,13 @@ function IssuesView({
     try {
       const newEn = fixEn.split('|').map(s => s.trim()).filter(Boolean)
       const newZh = fixZh.split('|').map(s => s.trim()).filter(Boolean)
-      const scope: Record<string, string> | undefined = fixScopeVersion.trim()
-        ? { version: fixScopeVersion.trim() }
-        : undefined
+      const scope: Record<string, string> | undefined =
+        fixScopeVersion.trim() || fixScopeKey.trim() || fixScopeEn.trim() || fixScopeZh.trim()
+          ? { ...(fixScopeVersion.trim() && { version: fixScopeVersion.trim() }),
+              ...(fixScopeKey.trim() && { key: fixScopeKey.trim() }),
+              ...(fixScopeEn.trim() && { en: fixScopeEn.trim() }),
+              ...(fixScopeZh.trim() && { zh: fixScopeZh.trim() }) }
+          : undefined
       
       // 先删除旧的，再添加新的（因为 updateTerm 依赖 en 匹配）
       if (fixingIssue.matched_terms.length > 0) {

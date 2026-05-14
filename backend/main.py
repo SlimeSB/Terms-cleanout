@@ -352,10 +352,12 @@ def generate_zh(en_text: str, phrase_map: dict[str, list[Term]],
         if opts:
             # Sort: longer zh first (None values at end)
             opts.sort(key=lambda x: -len(x[1]) if x[1] else 0)
-            # Mark words covered by this segment's longest phrase option
+            # Mark words covered only if a real term produced a translation
             n = opts[0][0]
-            for j in range(n):
-                word_covered[i + j] = True
+            zh_text = opts[0][1]
+            if zh_text is not None:
+                for j in range(n):
+                    word_covered[i + j] = True
         else:
             opts.append((1, None, False, None))
 
@@ -660,14 +662,18 @@ def api_list_terms(
 
 
 def extend_term_version_from_db(term: Term):
-    """Scan DB for exact en_us+zh_cn matches and extend term's scope.version."""
+    """Scan DB for exact en_us+zh_cn matches and extend term's scope.version.
+    Skips auto-detection when scope is explicitly set to an empty dict (user cleared it)."""
     from database import get_connection, _schema
     conn = get_connection()
     s = _schema()
     tbl = s['table']
     ver_col = s['ver_col']
     try:
-        scope = term.scope or {}
+        if term.scope is None:
+            scope = {}  # No scope set, will auto-detect from DB
+        else:
+            return  # User explicitly set scope (including {}), don't auto-detect
         for en_v in term.en:
             for zh_v in term.zh:
                 if s['type'] == 'translations':
