@@ -283,7 +283,9 @@ def fetch_terms(search: str = "", label: str = "", page: int = 1, page_size: int
         if search:
             conditions.append("(en LIKE ? OR zh LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
-        if label:
+        if label == "__none__":
+            conditions.append("(labels IS NULL OR labels = '[]')")
+        elif label:
             conditions.append("labels LIKE ?")
             params.append(f'%"{label}"%')
         where = " AND ".join(conditions) if conditions else "1=1"

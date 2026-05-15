@@ -29,6 +29,7 @@ export interface VersionInfo {
 }
 
 export interface Term {
+  id?: number
   en: string[]
   zh: string[]
   scope?: Record<string, string> | null
@@ -82,6 +83,9 @@ export const updateTerm = (en: string, term: Term) =>
 
 export const deleteTerm = (en: string) =>
   api.delete<{ deleted: string }>(`/terms/${encodeURIComponent(en)}`)
+
+export const deleteTermById = (id: number) =>
+  api.delete<{ deleted: number }>(`/terms/id/${id}`)
 
 export const exportTerms = () =>
   api.get<{ terms: Term[] }>('/terms/export')

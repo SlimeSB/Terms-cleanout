@@ -3,6 +3,7 @@ from typing import Optional
 
 
 class Term(BaseModel):
+    id: int | None = None
     en: list[str]
     zh: list[str]
     scope: dict[str, str] | None = None

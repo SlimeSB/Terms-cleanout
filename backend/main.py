@@ -49,6 +49,7 @@ def _rows_to_terms(rows: list[dict]) -> list[Term]:
     for r in rows:
         scope = json.loads(r["scope"]) if r.get("scope") else None
         terms.append(Term(
+            id=r["id"],
             en=json.loads(r["en"]),
             zh=json.loads(r["zh"]),
             scope=scope,
@@ -352,11 +353,11 @@ def generate_zh(en_text: str, phrase_map: dict[str, list[Term]],
         if opts:
             # Sort: longer zh first (None values at end)
             opts.sort(key=lambda x: -len(x[1]) if x[1] else 0)
-            # Mark words covered only if a real term produced a translation
-            n = opts[0][0]
+            # Mark words covered using max consume count (not just first by zh len)
+            coverage_n = max(o[0] for o in opts)
             zh_text = opts[0][1]
             if zh_text is not None:
-                for j in range(n):
+                for j in range(coverage_n):
                     word_covered[i + j] = True
         else:
             opts.append((1, None, False, None))
@@ -776,6 +777,13 @@ def api_update_term(en: str, term: Term):
         labels=json.dumps(term.labels, ensure_ascii=False),
     )
     return {"term": term}
+
+
+@app.delete("/api/terms/id/{term_id}")
+def api_delete_term_by_id(term_id: int):
+    init_terms_table()
+    delete_term_by_id(term_id)
+    return {"deleted": term_id}
 
 
 @app.delete("/api/terms/{en:path}")

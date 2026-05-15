@@ -216,5 +216,19 @@
   "datapackFailure.safeMode.failed.description",
   "quickplay.error.invalid_identifier",
   "^music",
-  "container.shulkerBox.unknownContents"
+  "container.shulkerBox.unknownContents",
+  "^painting",
+  "^test",
+  "^book",
+  "block.minecraft.player_head.named",
+  "^chat",
+  "compliance.playtime.hours",
+  "compliance.playtime.greaterThan24Hours",
+  "^selectServer",
+  "^connect",
+  "^container",
+  "^command",
+  "^createWorld",
+  "^dataPack",
+  "^debug"
 ]

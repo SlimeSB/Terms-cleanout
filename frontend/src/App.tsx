@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { Entry, EntryResponse, Term, ScanResult } from './api'
 import type { ScanAllIssue } from './api'
-import { getEntries, getTerms, addTerm, updateTerm, deleteTerm, exportTerms, importTerms, scanEntries, scanAll, getBlacklist, addToBlacklist, removeFromBlacklist, addLabel, removeLabel, getLabels, getGhostTerms, getNonTerms, addNonTerm, removeNonTerm } from './api'
+import { getEntries, getTerms, addTerm, updateTerm, deleteTerm, deleteTermById, exportTerms, importTerms, scanEntries, scanAll, getBlacklist, addToBlacklist, removeFromBlacklist, addLabel, removeLabel, getLabels, getGhostTerms, getNonTerms, addNonTerm, removeNonTerm } from './api'
 
 type Tab = 'entries' | 'terms' | 'issues'
 type IssueItem = ScanAllIssue & { source_term: string }
@@ -394,7 +394,7 @@ function EntriesView({ onIssuesAdd }: { onIssuesAdd: (term: string, results: Sca
 
   const openAdjacentCompare = async () => {
     if (!modalEntry) return
-    const res = await getEntries({ page_size: 200, hide_matched: 'false' })
+    const res = await getEntries({ page_size: 200, hide_matched: 'false', search, sort: sortMode })
     const allEntries = res.data.entries
     const idx = allEntries.findIndex(e => e.rowid === modalEntry.rowid)
     if (idx === -1) return
@@ -979,13 +979,14 @@ function TermsView() {
     loadLabels()
   }
 
-  const handleDeleteClick = (en: string) => {
-    if (confirmDelete === en && confirmReady) {
+  const handleDeleteClick = (id: number | null, en: string) => {
+    const key = id != null ? String(id) : en
+    if (confirmDelete === key && confirmReady) {
       setConfirmDelete(null)
       setConfirmReady(false)
-      doDelete(en)
-    } else if (confirmDelete !== en) {
-      setConfirmDelete(en)
+      doDelete(id, en)
+    } else if (confirmDelete !== key) {
+      setConfirmDelete(key)
       setConfirmReady(false)
       if (confirmTimer.current) clearTimeout(confirmTimer.current)
       confirmTimer.current = setTimeout(() => {
@@ -995,8 +996,12 @@ function TermsView() {
     }
   }
 
-  const doDelete = async (en: string) => {
-    await deleteTerm(en)
+  const doDelete = async (id: number | null, en: string) => {
+    if (id != null) {
+      await deleteTermById(id)
+    } else {
+      await deleteTerm(en)
+    }
     load()
     loadLabels()
   }
@@ -1158,7 +1163,7 @@ function TermsView() {
   }
 
   const handleEdit = (term: Term) => {
-    setEditingKey(term.en[0])
+    setEditingKey(String(term.id ?? term.en[0]))
     setEditingEn(term.en.join('|'))
     setEditingZh(term.zh.join('|'))
     setEditingScope(term.scope ?? null)
@@ -1171,14 +1176,19 @@ function TermsView() {
 
   const handleSaveEdit = async () => {
     if (!editingKey || !editingEn.trim() || !editingZh.trim()) return
-    const idx = terms.findIndex(t => t.en[0] === editingKey)
+    const editingId = parseInt(editingKey, 10)
+    const idx = isNaN(editingId) ? terms.findIndex(t => t.en[0] === editingKey) : terms.findIndex(t => t.id === editingId)
     const newEn = editingEn.split('|').map(s => s.trim()).filter(Boolean)
     const newZh = editingZh.split('|').map(s => s.trim()).filter(Boolean)
     if (newEn.length === 0 || newZh.length === 0) return
     const scope: Record<string, string> | undefined = (editingScopeVersion || editingScopeKey || editingScopeEn || editingScopeZh)
       ? { ...(editingScopeVersion && { version: editingScopeVersion }), ...(editingScopeKey && { key: editingScopeKey }), ...(editingScopeEn && { en: editingScopeEn }), ...(editingScopeZh && { zh: editingScopeZh }) }
       : {}
-    await deleteTerm(editingKey)
+    if (!isNaN(editingId)) {
+      await deleteTermById(editingId)
+    } else {
+      await deleteTerm(editingKey)
+    }
     const term: Term = { en: newEn, zh: newZh, scope, variable_pos: editingVariablePos }
     await addTerm(term)
     setEditingKey(null)
@@ -1266,6 +1276,7 @@ function TermsView() {
           onChange={e => setLabelFilter(e.target.value)}
         >
           <option value="">全部标签</option>
+          <option value="__none__">无标签</option>
           {allLabels.map(l => <option key={l} value={l}>{l}</option>)}
         </select>
 
@@ -1397,7 +1408,7 @@ function TermsView() {
             {terms.length === 0 && <tr><td colSpan={6} className="p-4 text-center text-gray-500">暂无术语</td></tr>}
             {terms.map((t) => (
               <tr key={`${t.en.join('|')}-${t.zh.join('|')}`} className={`border-t border-gray-800 hover:bg-gray-900 ${selectedKeys.has(t.en[0]) ? 'bg-blue-900/20' : ''}`}>
-                {editingKey === t.en[0] ? (
+                {editingKey === String(t.id ?? t.en[0]) ? (
                   <>
                     <td className="p-2 w-8"><input type="checkbox" checked={selectedKeys.has(t.en[0])} className="accent-blue-500" onClick={e => e.stopPropagation()} onChange={(ev) => {
                       const checked = ev.target.checked
@@ -1505,7 +1516,7 @@ function TermsView() {
                     </td>
                     <td className="p-2 flex gap-1">
                       <button onClick={() => handleEdit(t)} className="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-blue-700">编辑</button>
-                      <button onClick={() => handleDeleteClick(t.en[0])} disabled={confirmDelete === t.en[0] && !confirmReady} className={`text-xs px-2 py-0.5 rounded transition-colors ${confirmDelete === t.en[0] ? (confirmReady ? 'bg-red-600 hover:bg-red-500 text-white font-bold' : 'bg-red-900 text-red-400 cursor-not-allowed') : 'bg-gray-800 hover:bg-red-700'}`}>{confirmDelete === t.en[0] ? (confirmReady ? '确认?' : '...') : '删除'}</button>
+                      <button onClick={() => handleDeleteClick(t.id ?? null, t.en[0])} disabled={confirmDelete === String(t.id ?? t.en[0]) && !confirmReady} className={`text-xs px-2 py-0.5 rounded transition-colors ${confirmDelete === String(t.id ?? t.en[0]) ? (confirmReady ? 'bg-red-600 hover:bg-red-500 text-white font-bold' : 'bg-red-900 text-red-400 cursor-not-allowed') : 'bg-gray-800 hover:bg-red-700'}`}>{confirmDelete === String(t.id ?? t.en[0]) ? (confirmReady ? '确认?' : '...') : '删除'}</button>
                     </td>
                   </>
                 )}
@@ -1630,6 +1641,7 @@ function IssuesView({
   const [fixScopeKey, setFixScopeKey] = useState('')
   const [fixScopeEn, setFixScopeEn] = useState('')
   const [fixScopeZh, setFixScopeZh] = useState('')
+  const [fixOrigScope, setFixOrigScope] = useState<Record<string, string> | null | undefined>(undefined)
   const [fixMsg, setFixMsg] = useState('')
   const [fixScanResult, setFixScanResult] = useState<ScanResult[] | null>(null)
   const [fixTermIndex, setFixTermIndex] = useState(0)
@@ -1840,7 +1852,7 @@ function IssuesView({
             )}
 
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setFixingIssue(null); setFixMsg(''); setFixScanResult(null); setFixScopeKey(''); setFixScopeEn(''); setFixScopeZh('') }} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">关闭</button>
+              <button onClick={() => { setFixingIssue(null); setFixMsg(''); setFixScanResult(null); setFixScopeKey(''); setFixScopeEn(''); setFixScopeZh(''); setFixOrigScope(undefined) }} className="px-4 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm">关闭</button>
               <button onClick={saveFix} className="px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-sm">保存并扫描</button>
             </div>
           </div>
@@ -1857,6 +1869,7 @@ function IssuesView({
     setFixScopeKey('')
     setFixScopeEn('')
     setFixScopeZh('')
+    setFixOrigScope(undefined)
     if (issue.matched_terms.length > 0) {
       const termStr = issue.matched_terms[index] || issue.matched_terms[0]
       setFixEn(termStr)
@@ -1878,6 +1891,7 @@ function IssuesView({
         setFixScopeKey(foundTerm.scope?.key || '')
         setFixScopeEn(foundTerm.scope?.en || '')
         setFixScopeZh(foundTerm.scope?.zh || '')
+        setFixOrigScope(foundTerm.scope)
       } else {
         setFixZh('')
         setFixScopeVersion('')
@@ -1905,13 +1919,18 @@ function IssuesView({
     try {
       const newEn = fixEn.split('|').map(s => s.trim()).filter(Boolean)
       const newZh = fixZh.split('|').map(s => s.trim()).filter(Boolean)
-      const scope: Record<string, string> | undefined =
-        fixScopeVersion.trim() || fixScopeKey.trim() || fixScopeEn.trim() || fixScopeZh.trim()
-          ? { ...(fixScopeVersion.trim() && { version: fixScopeVersion.trim() }),
-              ...(fixScopeKey.trim() && { key: fixScopeKey.trim() }),
-              ...(fixScopeEn.trim() && { en: fixScopeEn.trim() }),
-              ...(fixScopeZh.trim() && { zh: fixScopeZh.trim() }) }
-          : undefined
+      const hasScopeInput = fixScopeVersion.trim() || fixScopeKey.trim() || fixScopeEn.trim() || fixScopeZh.trim()
+      let scope: Record<string, string> | undefined | null
+      if (hasScopeInput) {
+        scope = { ...(fixScopeVersion.trim() && { version: fixScopeVersion.trim() }),
+                  ...(fixScopeKey.trim() && { key: fixScopeKey.trim() }),
+                  ...(fixScopeEn.trim() && { en: fixScopeEn.trim() }),
+                  ...(fixScopeZh.trim() && { zh: fixScopeZh.trim() }) }
+      } else if (fixOrigScope === null) {
+        scope = {}  // preserve explicit "no scope", prevent backend auto-detect
+      } else {
+        scope = fixOrigScope ?? undefined
+      }
       
       // 先删除旧的，再添加新的（因为 updateTerm 依赖 en 匹配）
       if (fixingIssue.matched_terms.length > 0) {
